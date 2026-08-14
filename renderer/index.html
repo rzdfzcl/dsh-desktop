@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeepSeek Harness</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="splash" aria-live="polite">
+      <img class="splash-icon" src="../build/icon.ico" alt="" draggable="false" />
+      <h1>DeepSeek Harness</h1>
+      <p id="status-text">正在启动本地客户端…</p>
+      <div class="progress" aria-hidden="true"><span></span></div>
+      <small>正在准备 Harness，请稍候</small>
+      <div class="error-actions" aria-label="启动失败操作">
+        <button id="retry-button" class="primary" type="button">重新尝试</button>
+        <button id="open-logs-button" type="button">打开日志目录</button>
+        <button id="copy-diagnostics-button" type="button">复制诊断信息</button>
+      </div>
+      <span id="action-feedback" role="status"></span>
+    </main>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

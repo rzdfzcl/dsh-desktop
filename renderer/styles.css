@@ -1,0 +1,133 @@
+:root {
+  color: #111827;
+  background: #fff;
+  font-family: Inter, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #fff;
+}
+
+.splash {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  align-items: center;
+  flex-direction: column;
+  justify-content: center;
+  padding: 48px;
+  text-align: center;
+  user-select: none;
+}
+
+.splash-icon {
+  width: 58px;
+  height: 58px;
+  object-fit: contain;
+}
+
+h1 {
+  margin: 18px 0 8px;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -.02em;
+}
+
+p {
+  min-height: 20px;
+  margin: 0;
+  color: #596273;
+  font-size: 13px;
+}
+
+.progress {
+  width: 220px;
+  height: 3px;
+  margin: 22px 0 13px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: #edf0f4;
+}
+
+.progress span {
+  display: block;
+  width: 42%;
+  height: 100%;
+  border-radius: inherit;
+  background: #2563eb;
+  animation: loading 1.35s ease-in-out infinite;
+}
+
+small {
+  color: #a0a7b2;
+  font-size: 11px;
+}
+
+.error-actions {
+  display: none;
+  gap: 8px;
+  margin-top: 22px;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.splash[data-state="error"] .error-actions { display: flex; }
+
+button {
+  min-height: 32px;
+  padding: 0 13px;
+  border: 1px solid #d8dde5;
+  border-radius: 7px;
+  color: #374151;
+  background: #fff;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+button:hover { background: #f7f8fa; }
+button:focus-visible { outline: 2px solid #93b4ff; outline-offset: 2px; }
+button:disabled { cursor: default; opacity: .55; }
+
+button.primary {
+  border-color: #2563eb;
+  color: #fff;
+  background: #2563eb;
+}
+
+button.primary:hover { background: #1d4ed8; }
+
+#action-feedback {
+  min-height: 16px;
+  margin-top: 12px;
+  color: #7b8492;
+  font-size: 11px;
+}
+
+.splash[data-state="error"] p {
+  color: #c23646;
+  max-width: min(720px, 90vw);
+  max-height: 92px;
+  overflow: auto;
+  padding: 0 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.splash[data-state="error"] .progress span {
+  width: 100%;
+  background: #d84c5b;
+  animation: none;
+}
+
+@keyframes loading {
+  from { transform: translateX(-115%); }
+  to { transform: translateX(340%); }
+}

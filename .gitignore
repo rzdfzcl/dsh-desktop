@@ -1,0 +1,6 @@
+node_modules/
+release/
+.tmp/
+*.log
+*.pfx
+*.p12

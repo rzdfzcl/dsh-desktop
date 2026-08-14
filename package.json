@@ -1,0 +1,82 @@
+{
+  "name": "deepseek-harness-desktop",
+  "version": "1.0.11",
+  "description": "Windows desktop wrapper for DeepSeek Harness",
+  "main": "main.js",
+  "private": true,
+  "license": "MIT",
+  "author": "DeepSeek Harness Desktop Contributors",
+  "dshRuntime": {
+    "packageName": "@deepseek-ai/dsh",
+    "version": "0.1.0-rc.6",
+    "minimumNodeMajor": 20
+  },
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis --x64",
+    "dist:portable": "electron-builder --win portable --x64",
+    "dist:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1 -Target Installer -SkipInstall",
+    "dist:uninstaller:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1 -Target Uninstaller -SkipInstall",
+    "dist:portable:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1 -Target Portable -SkipInstall"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh": "0.1.0-rc.6",
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "ai.deepseek.dsh.desktop",
+    "productName": "DeepSeek Harness",
+    "copyright": "Copyright © 2026 DeepSeek Harness Desktop Contributors",
+    "asar": true,
+    "npmRebuild": false,
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "build/icon.ico",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "compression": "maximum",
+    "win": {
+      "icon": "build/icon.ico",
+      "electronLanguages": [
+        "zh-CN",
+        "en-US"
+      ],
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "guid": "e44e7520-68e2-553f-b35c-23a54f88393b",
+      "include": "build/installer.nsh",
+      "artifactName": "${productName}-${version}-Setup.${ext}",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "differentialPackage": false,
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DeepSeek Harness",
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable.${ext}",
+      "requestExecutionLevel": "user"
+    }
+  }
+}
