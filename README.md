@@ -68,9 +68,13 @@ $env:DSH_TIMESTAMP_URL = 'http://timestamp.digicert.com' # 可选
 ## 运行机制
 
 应用优先复用 `http://127.0.0.1:3080`，也可以通过 `DSH_DESKTOP_HOST` 指定
-其他地址。没有可用 Host 时，应用检查电脑上的全局 dsh；缺失时通过 npm 安装
-固定版本 `@deepseek-ai/dsh@0.1.0-rc.6`。如果电脑没有 Node.js/npm，则先通过
-winget 安装 Node.js LTS。dsh 不内置在 EXE 中。
+其他地址。没有可用 Host 时，应用会在启动页列出缺少或版本不符合要求的环境，
+由用户勾选后再下载和安装。dsh 固定安装为 `@deepseek-ai/dsh@0.1.0-rc.6`。
+
+如果电脑没有 Node.js/npm，可选择下载客户端专用的 Node.js 24.19.0。该运行时安装
+在客户端数据目录的 `runtime` 子目录，不需要管理员权限、不依赖 winget，也不会
+修改系统 PATH；官方源不可用时自动切换到 npmmirror。检测到 winget 的电脑也可在
+界面中选择安装系统版 Node.js。dsh 不内置在 EXE 中。
 
 本地 Host 使用以下参数启动，并在退出应用时自动结束：
 

@@ -302,6 +302,9 @@ if (-not $version -or -not $productName) {
 }
 $dshRuntimePackage = [string]$package.dshRuntime.packageName
 $dshRuntimeVersion = [string]$package.dshRuntime.version
+$minimumNodeMajor = [int]$package.dshRuntime.minimumNodeMajor
+$preferredNodeVersion = [string]$package.dshRuntime.preferredNodeVersion
+$preferredNodeSha256 = [string]$package.dshRuntime.preferredNodeSha256
 $lockedDshProperty = $package.devDependencies.PSObject.Properties[$dshRuntimePackage]
 $lockedDshVersion = if ($lockedDshProperty) { [string]$lockedDshProperty.Value } else { $null }
 if (-not $dshRuntimePackage -or -not $dshRuntimeVersion) {
@@ -309,6 +312,15 @@ if (-not $dshRuntimePackage -or -not $dshRuntimeVersion) {
 }
 if ($dshRuntimeVersion -ne $lockedDshVersion) {
   throw "dshRuntime.version ($dshRuntimeVersion) does not match devDependencies ($lockedDshVersion)."
+}
+if ($minimumNodeMajor -lt 20) {
+  throw "Invalid dshRuntime.minimumNodeMajor: $minimumNodeMajor"
+}
+if ($preferredNodeVersion -notmatch '^\d+\.\d+\.\d+$') {
+  throw "Invalid dshRuntime.preferredNodeVersion: $preferredNodeVersion"
+}
+if ($preferredNodeSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+  throw 'dshRuntime.preferredNodeSha256 must be a 64-character SHA-256 value.'
 }
 
 Initialize-CodeSigning

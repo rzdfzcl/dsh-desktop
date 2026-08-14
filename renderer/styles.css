@@ -27,6 +27,57 @@ body {
   user-select: none;
 }
 
+.requirements-panel {
+  display: none;
+  width: min(620px, 90vw);
+  margin-top: 20px;
+}
+
+.splash[data-state="requirements"] .requirements-panel { display: block; }
+.splash[data-state="requirements"] .progress { display: none; }
+.splash[data-state="requirements"] small { display: none; }
+
+.requirements-list {
+  display: grid;
+  gap: 10px;
+  max-height: 310px;
+  overflow: auto;
+  text-align: left;
+}
+
+.requirement-card {
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  gap: 11px;
+  padding: 14px 16px;
+  border: 1px solid #dfe4eb;
+  border-radius: 10px;
+  background: #fafbfc;
+  cursor: pointer;
+}
+
+.requirement-card:hover { border-color: #b9c7da; }
+.requirement-card input { margin: 3px 0 0; accent-color: #2563eb; }
+.requirement-body { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.requirement-body strong { color: #1f2937; font-size: 13px; }
+.requirement-version { color: #526071; font-size: 12px; }
+.requirement-description { color: #7b8492; font-size: 11px; line-height: 1.45; }
+.requirement-body select {
+  width: fit-content;
+  max-width: 100%;
+  min-height: 30px;
+  margin-top: 5px;
+  padding: 0 28px 0 9px;
+  border: 1px solid #d8dde5;
+  border-radius: 6px;
+  color: #374151;
+  background: #fff;
+  font: inherit;
+  font-size: 11px;
+}
+
+.install-button { margin-top: 13px; }
+
 .splash-icon {
   width: 58px;
   height: 58px;

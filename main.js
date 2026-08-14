@@ -3,8 +3,10 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const util = require('node:util');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const packageMetadata = require('./package.json');
 const {
   app,
@@ -13,6 +15,7 @@ const {
   dialog,
   ipcMain,
   Menu,
+  net,
   Tray,
   WebContentsView,
   nativeImage,
@@ -26,6 +29,13 @@ const DSH_PACKAGE_SCOPE = String(DSH_PACKAGE_NAME || '').split('/')[0];
 const DSH_REQUIRED_VERSION = packageMetadata.dshRuntime?.version;
 const DSH_NPM_SPEC = `${DSH_PACKAGE_NAME}@${DSH_REQUIRED_VERSION}`;
 const MIN_NODE_MAJOR = packageMetadata.dshRuntime?.minimumNodeMajor;
+const PREFERRED_NODE_VERSION = packageMetadata.dshRuntime?.preferredNodeVersion;
+const PREFERRED_NODE_SHA256 = packageMetadata.dshRuntime?.preferredNodeSha256;
+const DSH_ALLOWED_INSTALL_SCRIPTS = [
+  `@deepseek-ai/dsh-subprocess-local@${DSH_REQUIRED_VERSION}`,
+  'node-pty@1.1.0',
+  'koffi@3.1.5',
+];
 const DSH_INSTALL_ATTEMPTS_PER_REGISTRY = 2;
 const DSH_INSTALL_TIMEOUT_MS = 10 * 60_000;
 const NPM_REGISTRY_OFFICIAL = 'https://registry.npmjs.org/';
@@ -35,6 +45,8 @@ const LOG_BACKUP_COUNT = 4;
 const HOST_RECOVERY_MAX_ATTEMPTS = 3;
 const HOST_RECOVERY_STABLE_MS = 60_000;
 const HOST_UI_LOAD_ATTEMPTS = 4;
+const POWERSHELL_EXPAND_ARCHIVE_COMMAND =
+  '& { param($archive, $destination) $ErrorActionPreference = "Stop"; Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force }';
 
 let mainWindow = null;
 let harnessView = null;
@@ -55,11 +67,20 @@ let installationClosePromptOpen = false;
 let usingExternalHost = false;
 let isQuitting = false;
 const managedInstallationProcesses = new Set();
+const managedInstallationDownloads = new Set();
 const intentionalHostStops = new Set();
 let currentServiceState = {
   state: 'starting',
   message: '正在启动 DeepSeek Harness…',
 };
+
+class EnvironmentRequirementsError extends Error {
+  constructor(requirements) {
+    super('需要安装运行环境');
+    this.name = 'EnvironmentRequirementsError';
+    this.requirements = requirements;
+  }
+}
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -96,15 +117,15 @@ function registerAppLifecycle() {
   });
 }
 
-function bootstrapHarness() {
+function bootstrapHarness(options = {}) {
   if (bootstrapPromise) return bootstrapPromise;
-  bootstrapPromise = runBootstrapHarness().finally(() => {
+  bootstrapPromise = runBootstrapHarness(options).finally(() => {
     bootstrapPromise = null;
   });
   return bootstrapPromise;
 }
 
-async function runBootstrapHarness() {
+async function runBootstrapHarness(options = {}) {
   cancelHostRecovery();
   hostRecoveryAttempts = 0;
   publishServiceState('starting', '正在检查 DeepSeek Harness 运行环境…');
@@ -122,7 +143,7 @@ async function runBootstrapHarness() {
       usingExternalHost = true;
       publishServiceState('connecting', `已发现现有 Harness Host：${existingHost}`);
     } else {
-      const installedDsh = await ensureGlobalDsh();
+      const installedDsh = await ensureGlobalDsh(options);
       await startDshHost(installedDsh);
     }
     await loadOfficialHarnessUi(dshUrl);
@@ -133,6 +154,15 @@ async function runBootstrapHarness() {
     );
     return { ok: true };
   } catch (error) {
+    if (error instanceof EnvironmentRequirementsError) {
+      publishServiceState(
+        'requirements',
+        '检测到缺少的运行环境，请选择需要下载安装的项目',
+        { requirements: error.requirements },
+      );
+      showMainWindow();
+      return { ok: false, needsInstallation: true };
+    }
     console.error('[desktop] Failed to start dsh:', error);
     if (isQuitting) return { ok: false, error: '客户端正在退出' };
     publishServiceState('error', error.message || 'DeepSeek Harness 启动失败');
@@ -168,7 +198,7 @@ function createMainWindow() {
   void mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   mainWindow.once('ready-to-show', () => mainWindow?.show());
   mainWindow.webContents.on('did-finish-load', () => {
-    publishServiceState(currentServiceState.state, currentServiceState.message);
+    mainWindow?.webContents.send('dsh:state', currentServiceState);
   });
   mainWindow.on('resize', layoutHarnessView);
   mainWindow.on('close', (event) => {
@@ -230,6 +260,16 @@ function registerIpcHandlers() {
   ipcMain.handle('dsh:retry', async (event) => {
     if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
     return bootstrapHarness();
+  });
+
+  ipcMain.handle('dsh:install-requirements', async (event, request) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    const installRequirements = Array.isArray(request?.requirements)
+      ? [...new Set(request.requirements.filter((item) => item === 'node' || item === 'dsh'))]
+      : [];
+    const nodeInstallMethod = request?.nodeInstallMethod === 'winget' ? 'winget' : 'managed';
+    if (!installRequirements.length) return { ok: false, error: '请至少选择一个安装项目' };
+    return bootstrapHarness({ installRequirements, nodeInstallMethod });
   });
 
   ipcMain.handle('dsh:open-logs', async (event) => {
@@ -316,7 +356,9 @@ async function createDiagnosticReport() {
   try {
     const runtimes = await findNpmRuntimes();
     nodeSummary = runtimes.length
-      ? runtimes.map((runtime) => `${runtime.version} (${runtime.node})`).join('; ')
+      ? runtimes.map((runtime) => (
+        `${runtime.version} / npm ${runtime.npmVersion} (${runtime.node})`
+      )).join('; ')
       : '未检测';
   } catch (error) {
     nodeSummary = `检测失败：${error.message}`;
@@ -336,6 +378,7 @@ async function createDiagnosticReport() {
     `Host 自动恢复：${hostRecoveryPromise ? '进行中' : '空闲'}，次数 ${hostRecoveryAttempts}/${HOST_RECOVERY_MAX_ATTEMPTS}`,
     `安装任务：${installationSessionDepth > 0 ? '进行中' : '无'}`,
     `安装进程 PID：${[...managedInstallationProcesses].map((child) => child.pid).filter(Boolean).join(', ') || '无'}`,
+    `安装下载任务：${managedInstallationDownloads.size}`,
     `日志文件：${logFilePath || '未初始化'}`,
     `生成时间：${new Date().toISOString()}`,
   ].join('\r\n');
@@ -345,8 +388,8 @@ function createAppIcon() {
   return nativeImage.createFromPath(path.join(__dirname, 'build', 'icon.ico'));
 }
 
-function publishServiceState(state, message) {
-  currentServiceState = { state, message };
+function publishServiceState(state, message, details = {}) {
+  currentServiceState = { state, message, ...details };
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send('dsh:state', currentServiceState);
 }
@@ -693,7 +736,7 @@ async function findListeningUrls(pid) {
   return [...ports].map((port) => `http://127.0.0.1:${port}`);
 }
 
-async function ensureGlobalDsh() {
+async function ensureGlobalDsh(options = {}) {
   publishServiceState('installing', '正在检查电脑上的 DeepSeek Harness…');
   if (!/^@[0-9A-Za-z._-]+\/[0-9A-Za-z._-]+$/.test(DSH_PACKAGE_NAME || '')) {
     throw new Error('package.json 中的 dshRuntime.packageName 无效');
@@ -704,52 +747,93 @@ async function ensureGlobalDsh() {
   if (!Number.isInteger(MIN_NODE_MAJOR) || MIN_NODE_MAJOR < 20) {
     throw new Error('package.json 中的 dshRuntime.minimumNodeMajor 无效');
   }
+  if (!/^\d+\.\d+\.\d+$/.test(PREFERRED_NODE_VERSION || '') ||
+      !/^[0-9a-f]{64}$/i.test(PREFERRED_NODE_SHA256 || '')) {
+    throw new Error('package.json 中的 Node.js 下载版本或 SHA-256 无效');
+  }
 
+  const approvedRequirements = new Set(
+    Array.isArray(options.installRequirements) ? options.installRequirements : [],
+  );
   let nodeRuntimes = await findNpmRuntimes();
   let npmRuntime = nodeRuntimes.find((runtime) => runtime.major >= MIN_NODE_MAJOR) || null;
 
   if (!npmRuntime) {
     const detectedVersion = nodeRuntimes[0]?.version;
-    publishServiceState(
-      'installing',
-      detectedVersion
-        ? `Node.js ${detectedVersion} 版本过低，正在升级到 LTS…`
-        : '未检测到 Node.js，正在通过 winget 安装 Node.js LTS…',
-    );
     const winget = await findExecutable('winget.exe');
-    if (!winget) {
-      throw new Error(
+    if (!approvedRequirements.has('node')) {
+      const nodeStatus = detectedVersion ? 'outdated' : 'missing';
+      throw new EnvironmentRequirementsError([
+        {
+          id: 'node',
+          name: 'Node.js / npm',
+          status: nodeStatus,
+          currentVersion: detectedVersion || null,
+          requiredVersion: `Node.js ${PREFERRED_NODE_VERSION}（最低 v${MIN_NODE_MAJOR}）`,
+          description: detectedVersion
+            ? `当前 ${detectedVersion} 版本过低，DeepSeek Harness 无法运行。`
+            : '电脑上未检测到可用的 Node.js 和 npm。',
+          methods: [
+            {
+              id: 'managed',
+              label: '客户端专用安装（推荐，无需管理员权限）',
+            },
+            ...(winget ? [{ id: 'winget', label: '通过 winget 安装系统版' }] : []),
+          ],
+        },
+        {
+          id: 'dsh',
+          name: 'DeepSeek Harness',
+          status: 'pending',
+          currentVersion: null,
+          requiredVersion: DSH_REQUIRED_VERSION,
+          description: '安装 Node.js 后继续校验，并在缺失时自动安装。',
+          dependsOn: ['node'],
+        },
+      ]);
+    }
+    let wingetFailure = null;
+
+    if (options.nodeInstallMethod === 'winget' && winget) {
+      publishServiceState(
+        'installing',
         detectedVersion
-          ? `当前 Node.js ${detectedVersion} 低于最低要求 v${MIN_NODE_MAJOR}，且找不到 winget；请安装 Node.js 24 LTS`
-          : '电脑上未安装 Node.js/npm，且找不到 winget；请先安装 Node.js 24 LTS',
+          ? `Node.js ${detectedVersion} 版本过低，正在通过 winget 升级…`
+          : '未检测到 Node.js，正在通过 winget 安装 Node.js LTS…',
       );
-    }
-
-    const actions = detectedVersion ? ['upgrade', 'install'] : ['install'];
-    let lastInstallResult = null;
-    await withInstallationSession(async () => {
-      for (const action of actions) {
-        lastInstallResult = await runProcess(winget, [
-          action, '--id', 'OpenJS.NodeJS.LTS', '--exact', '--silent',
-          '--accept-package-agreements', '--accept-source-agreements',
-        ], 15 * 60_000, true, true);
-        if (lastInstallResult.cancelled) throw new Error('Node.js 安装已取消');
-        if (isSuccessfulInstallerExit(lastInstallResult.code)) break;
+      const actions = detectedVersion ? ['upgrade', 'install'] : ['install'];
+      let lastInstallResult = null;
+      await withInstallationSession(async () => {
+        for (const action of actions) {
+          lastInstallResult = await runProcess(winget, [
+            action, '--id', 'OpenJS.NodeJS.LTS', '--exact', '--silent',
+            '--accept-package-agreements', '--accept-source-agreements',
+          ], 15 * 60_000, true, true);
+          if (lastInstallResult.cancelled) throw new Error('Node.js 安装已取消');
+          if (isSuccessfulInstallerExit(lastInstallResult.code)) break;
+        }
+      });
+      if (!lastInstallResult || !isSuccessfulInstallerExit(lastInstallResult.code)) {
+        wingetFailure = tail(lastInstallResult?.stderr || lastInstallResult?.stdout);
+        console.error(`[install] winget 安装 Node.js 失败，将使用客户端专用运行时：${wingetFailure}`);
       }
-    });
-    if (!lastInstallResult || !isSuccessfulInstallerExit(lastInstallResult.code)) {
-      throw new Error(`Node.js 自动安装失败：${tail(lastInstallResult?.stderr || lastInstallResult?.stdout)}`);
+      nodeRuntimes = await findNpmRuntimes();
+      npmRuntime = nodeRuntimes.find((runtime) => runtime.major >= MIN_NODE_MAJOR) || null;
     }
 
-    nodeRuntimes = await findNpmRuntimes();
-    npmRuntime = nodeRuntimes.find((runtime) => runtime.major >= MIN_NODE_MAJOR) || null;
     if (!npmRuntime) {
-      const currentVersion = nodeRuntimes[0]?.version;
-      throw new Error(
-        currentVersion
-          ? `Node.js 已安装，但当前检测到的 ${currentVersion} 仍低于最低要求 v${MIN_NODE_MAJOR}；请重启客户端`
-          : 'Node.js 已安装，但暂时找不到可用的 npm；请重启客户端',
+      publishServiceState(
+        'installing',
+        winget
+          ? '系统 Node.js 安装不可用，正在准备客户端专用 Node.js…'
+          : '未找到 winget，正在下载客户端专用 Node.js…',
       );
+      try {
+        npmRuntime = await withInstallationSession(ensureManagedNodeRuntime);
+      } catch (error) {
+        const wingetDetail = wingetFailure ? `；winget：${wingetFailure}` : '';
+        throw new Error(`Node.js 自动安装失败：${error.message || error}${wingetDetail}`);
+      }
     }
   }
 
@@ -761,6 +845,19 @@ async function ensureGlobalDsh() {
   for (const packageRoot of packageRoots) {
     const validated = await validateDshInstallation(npmRuntime.node, packageRoot);
     if (validated) return validated;
+  }
+
+  if (!approvedRequirements.has('dsh')) {
+    throw new EnvironmentRequirementsError([
+      {
+        id: 'dsh',
+        name: 'DeepSeek Harness',
+        status: 'missing',
+        currentVersion: null,
+        requiredVersion: DSH_REQUIRED_VERSION,
+        description: '未检测到要求版本的 dsh，需要通过 npm 下载并安装。',
+      },
+    ]);
   }
 
   await withInstallationSession(() => installDshWithRegistryFallback(npmRuntime));
@@ -791,7 +888,7 @@ async function installDshWithRegistryFallback(runtime) {
         `正在安装 ${DSH_NPM_SPEC}（${registryLabel}${attemptText}）…`,
       );
 
-      const result = await runProcess(runtime.node, [
+      const installArguments = [
         runtime.cli,
         'install', '-g', DSH_NPM_SPEC,
         `--registry=${registry}`,
@@ -800,7 +897,18 @@ async function installDshWithRegistryFallback(runtime) {
         '--fetch-retry-mintimeout=1000',
         '--fetch-retry-maxtimeout=10000',
         '--fetch-timeout=60000',
-      ], DSH_INSTALL_TIMEOUT_MS, true, true);
+      ];
+      if (runtime.managed) installArguments.push(`--prefix=${runtime.root}`);
+      if (runtime.npmMajor >= 11) {
+        installArguments.push(`--allow-scripts=${DSH_ALLOWED_INSTALL_SCRIPTS.join(',')}`);
+      }
+      const result = await runProcess(
+        runtime.node,
+        installArguments,
+        DSH_INSTALL_TIMEOUT_MS,
+        true,
+        true,
+      );
       if (result.cancelled) throw new Error('dsh 安装已取消');
       if (result.code === 0) {
         console.log(`[install] ${DSH_NPM_SPEC} 安装成功，来源：${registryLabel}`);
@@ -914,11 +1022,178 @@ async function validateDshInstallation(node, packageRoot) {
 }
 
 async function getGlobalNpmRoot(runtime) {
-  const result = await runProcess(runtime.node, [runtime.cli, 'root', '-g'], 30_000);
+  const argumentsList = [runtime.cli, 'root', '-g'];
+  if (runtime.managed) argumentsList.push(`--prefix=${runtime.root}`);
+  const result = await runProcess(runtime.node, argumentsList, 30_000);
   if (result.code !== 0) throw new Error(`无法读取 npm 全局目录：${tail(result.stderr)}`);
   const root = result.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
   if (!root) throw new Error('npm 未返回全局模块目录');
   return root;
+}
+
+function getManagedNodeDirectory() {
+  return path.join(
+    app.getPath('userData'),
+    'runtime',
+    `node-v${PREFERRED_NODE_VERSION}-win-x64`,
+  );
+}
+
+async function ensureManagedNodeRuntime() {
+  const runtimeRoot = path.join(app.getPath('userData'), 'runtime');
+  const finalDirectory = getManagedNodeDirectory();
+  const existing = await inspectNpmRuntimeRoot(finalDirectory);
+  if (existing?.major >= MIN_NODE_MAJOR) {
+    console.log(`[install] 使用客户端专用 Node.js：${existing.version} (${finalDirectory})`);
+    return existing;
+  }
+
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  const archiveName = `node-v${PREFERRED_NODE_VERSION}-win-x64.zip`;
+  // Expand-Archive only accepts paths whose final extension is .zip.
+  const archivePath = path.join(runtimeRoot, `${archiveName}.download.zip`);
+  const stagingDirectory = path.join(runtimeRoot, `extract-${randomUUID()}`);
+  const extractedDirectory = path.join(
+    stagingDirectory,
+    `node-v${PREFERRED_NODE_VERSION}-win-x64`,
+  );
+  const sources = [
+    `https://nodejs.org/dist/v${PREFERRED_NODE_VERSION}/${archiveName}`,
+    `https://npmmirror.com/mirrors/node/v${PREFERRED_NODE_VERSION}/${archiveName}`,
+  ];
+  const failures = [];
+
+  try {
+    let downloaded = false;
+    for (const source of sources) {
+      removeManagedRuntimePath(runtimeRoot, archivePath);
+      const sourceLabel = new URL(source).host;
+      publishServiceState(
+        'installing',
+        `正在从 ${sourceLabel} 下载 Node.js ${PREFERRED_NODE_VERSION}…`,
+      );
+      try {
+        await downloadManagedFile(source, archivePath, 10 * 60_000);
+        const actualHash = await calculateFileSha256(archivePath);
+        if (actualHash.toLowerCase() !== PREFERRED_NODE_SHA256.toLowerCase()) {
+          throw new Error(`SHA-256 不匹配（${actualHash}）`);
+        }
+        console.log(`[install] Node.js 下载校验通过：${actualHash}`);
+        downloaded = true;
+        break;
+      } catch (error) {
+        if (installationCancellationRequested) throw error;
+        failures.push(`${sourceLabel}：${error.message || error}`);
+        console.error(`[install] Node.js 下载失败，来源：${sourceLabel}`, error);
+      }
+    }
+    if (!downloaded) {
+      throw new Error(`所有 Node.js 下载源均不可用：${tail(failures.join('\n'), 1_000)}`);
+    }
+
+    publishServiceState('installing', `正在解压 Node.js ${PREFERRED_NODE_VERSION}…`);
+    fs.mkdirSync(stagingDirectory, { recursive: true });
+    const powershell = await findExecutable('powershell.exe');
+    if (!powershell) throw new Error('找不到 PowerShell，无法解压 Node.js');
+    const extracted = await runProcess(powershell, [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-Command', POWERSHELL_EXPAND_ARCHIVE_COMMAND, archivePath, stagingDirectory,
+    ], 10 * 60_000, true, true);
+    if (extracted.cancelled) throw new Error('Node.js 安装已取消');
+    if (extracted.code !== 0) {
+      throw new Error(`Node.js 解压失败：${tail(extracted.stderr || extracted.stdout)}`);
+    }
+    const extractionCandidates = [
+      extractedDirectory,
+      stagingDirectory,
+      ...fs.readdirSync(stagingDirectory, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(stagingDirectory, entry.name)),
+    ];
+    let extractedRuntimeDirectory = null;
+    for (const candidate of [...new Set(extractionCandidates.map((item) => path.resolve(item)))]) {
+      const candidateRuntime = await inspectNpmRuntimeRoot(candidate);
+      if (candidateRuntime?.major >= MIN_NODE_MAJOR) {
+        extractedRuntimeDirectory = candidate;
+        break;
+      }
+    }
+    if (!extractedRuntimeDirectory) {
+      const extractedEntries = fs.readdirSync(stagingDirectory).slice(0, 12).join(', ');
+      throw new Error(
+        `Node.js 解压完成，但找不到 node.exe/npm（解压内容：${extractedEntries || '空'}）`,
+      );
+    }
+
+    removeManagedRuntimePath(runtimeRoot, finalDirectory);
+    fs.renameSync(extractedRuntimeDirectory, finalDirectory);
+    const runtime = await inspectNpmRuntimeRoot(finalDirectory);
+    if (!runtime || runtime.major < MIN_NODE_MAJOR) {
+      throw new Error('客户端专用 Node.js 安装完成，但运行检查未通过');
+    }
+    console.log(`[install] 客户端专用 Node.js 安装成功：${runtime.version}`);
+    return runtime;
+  } finally {
+    removeManagedRuntimePath(runtimeRoot, archivePath);
+    removeManagedRuntimePath(runtimeRoot, stagingDirectory);
+  }
+}
+
+async function downloadManagedFile(url, destination, timeoutMs) {
+  const controller = new AbortController();
+  managedInstallationDownloads.add(controller);
+  const timeout = setTimeout(() => controller.abort(new Error('下载超时')), timeoutMs);
+  try {
+    const response = await net.fetch(url, { signal: controller.signal });
+    if (!response.ok || !response.body) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    await pipeline(
+      Readable.fromWeb(response.body),
+      fs.createWriteStream(destination, { flags: 'w' }),
+    );
+  } finally {
+    clearTimeout(timeout);
+    managedInstallationDownloads.delete(controller);
+  }
+}
+
+function calculateFileSha256(file) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const input = fs.createReadStream(file);
+    input.on('error', reject);
+    input.on('data', (chunk) => hash.update(chunk));
+    input.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+function removeManagedRuntimePath(runtimeRoot, target) {
+  const relative = path.relative(path.resolve(runtimeRoot), path.resolve(target));
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return;
+  fs.rmSync(target, { recursive: true, force: true });
+}
+
+async function inspectNpmRuntimeRoot(root) {
+  const node = path.join(root, 'node.exe');
+  const cli = path.join(root, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (!fs.existsSync(node) || !fs.existsSync(cli)) return null;
+  const versionResult = await runProcess(node, ['--version'], 10_000, false);
+  const parsedVersion = parseNodeVersion(versionResult.stdout);
+  if (versionResult.code !== 0 || !parsedVersion) return null;
+  const npmVersionResult = await runProcess(node, [cli, '--version'], 10_000, false);
+  const npmVersion = npmVersionResult.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
+  const npmMajor = Number.parseInt(String(npmVersion || '').split('.')[0], 10);
+  if (npmVersionResult.code !== 0 || !Number.isInteger(npmMajor)) return null;
+  return {
+    node,
+    cli,
+    root,
+    managed: path.resolve(root) === path.resolve(getManagedNodeDirectory()),
+    npmVersion,
+    npmMajor,
+    ...parsedVersion,
+  };
 }
 
 async function findNpmRuntimes() {
@@ -929,18 +1204,13 @@ async function findNpmRuntimes() {
     ...nodeCommands.map((item) => path.dirname(item)),
     path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs'),
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'nodejs'),
+    getManagedNodeDirectory(),
   ].filter(Boolean);
 
   const runtimes = [];
   for (const root of [...new Set(roots.map((item) => path.resolve(item)))]) {
-    const node = path.join(root, 'node.exe');
-    const cli = path.join(root, 'node_modules', 'npm', 'bin', 'npm-cli.js');
-    if (!fs.existsSync(node) || !fs.existsSync(cli)) continue;
-
-    const versionResult = await runProcess(node, ['--version'], 10_000, false);
-    const parsedVersion = parseNodeVersion(versionResult.stdout);
-    if (versionResult.code !== 0 || !parsedVersion) continue;
-    runtimes.push({ node, cli, ...parsedVersion });
+    const runtime = await inspectNpmRuntimeRoot(root);
+    if (runtime) runtimes.push(runtime);
   }
   return runtimes;
 }
@@ -984,6 +1254,9 @@ async function withInstallationSession(operation) {
 }
 
 async function terminateManagedInstallationProcesses() {
+  for (const controller of managedInstallationDownloads) {
+    controller.abort(new Error('安装已取消'));
+  }
   const processes = [...managedInstallationProcesses];
   if (!processes.length) return;
   console.log(`[install] 正在终止 ${processes.length} 个安装进程树…`);
