@@ -45,6 +45,8 @@ const LOG_BACKUP_COUNT = 4;
 const HOST_RECOVERY_MAX_ATTEMPTS = 3;
 const HOST_RECOVERY_STABLE_MS = 60_000;
 const HOST_UI_LOAD_ATTEMPTS = 4;
+const MANAGED_RUNTIME_FS_MAX_RETRIES = 8;
+const MANAGED_RUNTIME_FS_RETRY_DELAY_MS = 100;
 const POWERSHELL_EXPAND_ARCHIVE_COMMAND =
   '& { param($archive, $destination) $ErrorActionPreference = "Stop"; Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force }';
 
@@ -538,7 +540,7 @@ function startDshHost(runtime, statusMessage = '正在启动本地 Harness Host�
       {
         cwd: app.getPath('home'),
         env: {
-          ...process.env,
+          ...createRuntimeProcessEnvironment(runtime),
           FORCE_COLOR: '0',
         },
         windowsHide: true,
@@ -908,6 +910,7 @@ async function installDshWithRegistryFallback(runtime) {
         DSH_INSTALL_TIMEOUT_MS,
         true,
         true,
+        createRuntimeProcessEnvironment(runtime),
       );
       if (result.cancelled) throw new Error('dsh 安装已取消');
       if (result.code === 0) {
@@ -934,6 +937,19 @@ async function installDshWithRegistryFallback(runtime) {
   }
 
   throw new Error(`dsh 自动安装失败，所有安装源均不可用：${tail(failures.join('\n'), 1_200)}`);
+}
+
+function createRuntimeProcessEnvironment(runtime) {
+  const environment = { ...process.env };
+  const pathKey = Object.keys(environment).find((key) => key.toLowerCase() === 'path') || 'PATH';
+  const nodeDirectory = path.dirname(runtime.node);
+  const currentPath = String(environment[pathKey] || '');
+  const entries = currentPath.split(path.delimiter).filter(Boolean);
+  if (!entries.some((entry) => path.resolve(entry).toLowerCase() === nodeDirectory.toLowerCase())) {
+    entries.unshift(nodeDirectory);
+  }
+  environment[pathKey] = entries.join(path.delimiter);
+  return environment;
 }
 
 async function getNpmRegistryCandidates(runtime) {
@@ -1041,6 +1057,8 @@ function getManagedNodeDirectory() {
 
 async function ensureManagedNodeRuntime() {
   const runtimeRoot = path.join(app.getPath('userData'), 'runtime');
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  cleanupStaleManagedRuntimePaths(runtimeRoot);
   const finalDirectory = getManagedNodeDirectory();
   const existing = await inspectNpmRuntimeRoot(finalDirectory);
   if (existing?.major >= MIN_NODE_MAJOR) {
@@ -1048,7 +1066,6 @@ async function ensureManagedNodeRuntime() {
     return existing;
   }
 
-  fs.mkdirSync(runtimeRoot, { recursive: true });
   const archiveName = `node-v${PREFERRED_NODE_VERSION}-win-x64.zip`;
   // Expand-Archive only accepts paths whose final extension is .zip.
   const archivePath = path.join(runtimeRoot, `${archiveName}.download.zip`);
@@ -1126,7 +1143,7 @@ async function ensureManagedNodeRuntime() {
     }
 
     removeManagedRuntimePath(runtimeRoot, finalDirectory);
-    fs.renameSync(extractedRuntimeDirectory, finalDirectory);
+    await renameManagedRuntimePath(runtimeRoot, extractedRuntimeDirectory, finalDirectory);
     const runtime = await inspectNpmRuntimeRoot(finalDirectory);
     if (!runtime || runtime.major < MIN_NODE_MAJOR) {
       throw new Error('客户端专用 Node.js 安装完成，但运行检查未通过');
@@ -1134,8 +1151,8 @@ async function ensureManagedNodeRuntime() {
     console.log(`[install] 客户端专用 Node.js 安装成功：${runtime.version}`);
     return runtime;
   } finally {
-    removeManagedRuntimePath(runtimeRoot, archivePath);
-    removeManagedRuntimePath(runtimeRoot, stagingDirectory);
+    cleanupManagedRuntimePath(runtimeRoot, archivePath);
+    cleanupManagedRuntimePath(runtimeRoot, stagingDirectory);
   }
 }
 
@@ -1169,9 +1186,50 @@ function calculateFileSha256(file) {
 }
 
 function removeManagedRuntimePath(runtimeRoot, target) {
+  if (!isManagedRuntimePath(runtimeRoot, target)) return;
+  fs.rmSync(target, {
+    recursive: true,
+    force: true,
+    maxRetries: MANAGED_RUNTIME_FS_MAX_RETRIES,
+    retryDelay: MANAGED_RUNTIME_FS_RETRY_DELAY_MS,
+  });
+}
+
+function cleanupManagedRuntimePath(runtimeRoot, target) {
+  try {
+    removeManagedRuntimePath(runtimeRoot, target);
+  } catch (error) {
+    console.warn(`[install] 无法清理临时运行时路径，将在下次启动时重试：${target}`, error);
+  }
+}
+
+function cleanupStaleManagedRuntimePaths(runtimeRoot) {
+  for (const entry of fs.readdirSync(runtimeRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^extract-[0-9a-f-]{36}$/i.test(entry.name)) continue;
+    cleanupManagedRuntimePath(runtimeRoot, path.join(runtimeRoot, entry.name));
+  }
+}
+
+function isManagedRuntimePath(runtimeRoot, target) {
   const relative = path.relative(path.resolve(runtimeRoot), path.resolve(target));
-  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return;
-  fs.rmSync(target, { recursive: true, force: true });
+  return Boolean(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+async function renameManagedRuntimePath(runtimeRoot, source, destination) {
+  if (!isManagedRuntimePath(runtimeRoot, source) || !isManagedRuntimePath(runtimeRoot, destination)) {
+    throw new Error('拒绝移动运行时目录之外的路径');
+  }
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(source, destination);
+      return;
+    } catch (error) {
+      const retryable = ['EACCES', 'EBUSY', 'ENOTEMPTY', 'EPERM'].includes(error?.code);
+      if (!retryable || attempt >= MANAGED_RUNTIME_FS_MAX_RETRIES) throw error;
+      await delay(MANAGED_RUNTIME_FS_RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
 }
 
 async function inspectNpmRuntimeRoot(root) {
@@ -1297,7 +1355,14 @@ function terminateProcessTree(child) {
   });
 }
 
-function runProcess(executable, args, timeoutMs, logOutput = true, manageInstallation = false) {
+function runProcess(
+  executable,
+  args,
+  timeoutMs,
+  logOutput = true,
+  manageInstallation = false,
+  environment = process.env,
+) {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
@@ -1306,6 +1371,7 @@ function runProcess(executable, args, timeoutMs, logOutput = true, manageInstall
     const child = spawn(executable, args, {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: environment,
     });
     if (manageInstallation) {
       managedInstallationProcesses.add(child);
@@ -1338,7 +1404,10 @@ function runProcess(executable, args, timeoutMs, logOutput = true, manageInstall
       stderr += error.message;
       finish(-1);
     });
-    child.once('exit', (code) => finish(code ?? -1));
+    // On Windows, `exit` may fire while stdio/process handles are still being
+    // released. Waiting for `close` prevents immediate runtime moves from
+    // intermittently failing with EPERM/EBUSY after node.exe has exited.
+    child.once('close', (code) => finish(code ?? -1));
     timer = setTimeout(() => {
       stderr += `\n执行超时（${timeoutMs}ms）`;
       if (manageInstallation) {

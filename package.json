@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "1.0.14",
+  "version": "1.0.16",
   "description": "Windows desktop wrapper for DeepSeek Harness",
   "main": "main.js",
   "private": true,
@@ -32,6 +32,7 @@
     "productName": "DeepSeek Harness",
     "copyright": "Copyright © 2026 DeepSeek Harness Desktop Contributors",
     "asar": true,
+    "electronDist": "node_modules/electron/dist",
     "npmRebuild": false,
     "files": [
       "main.js",
