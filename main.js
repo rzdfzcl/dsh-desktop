@@ -28,6 +28,9 @@ const DSH_PACKAGE_NAME = packageMetadata.dshRuntime?.packageName;
 const DSH_PACKAGE_SCOPE = String(DSH_PACKAGE_NAME || '').split('/')[0];
 const DSH_REQUIRED_VERSION = packageMetadata.dshRuntime?.version;
 const DSH_NPM_SPEC = `${DSH_PACKAGE_NAME}@${DSH_REQUIRED_VERSION}`;
+const PNPM_REQUIRED_VERSION = packageMetadata.dshRuntime?.pnpmVersion;
+const PNPM_NPM_SPEC = `pnpm@${PNPM_REQUIRED_VERSION}`;
+const MIN_PNPM_MAJOR = packageMetadata.dshRuntime?.minimumPnpmMajor;
 const MIN_NODE_MAJOR = packageMetadata.dshRuntime?.minimumNodeMajor;
 const PREFERRED_NODE_VERSION = packageMetadata.dshRuntime?.preferredNodeVersion;
 const PREFERRED_NODE_SHA256 = packageMetadata.dshRuntime?.preferredNodeSha256;
@@ -45,6 +48,17 @@ const LOG_BACKUP_COUNT = 4;
 const HOST_RECOVERY_MAX_ATTEMPTS = 3;
 const HOST_RECOVERY_STABLE_MS = 60_000;
 const HOST_UI_LOAD_ATTEMPTS = 4;
+const TOP_NAVIGATION_HEIGHT = 42;
+const SIDEBAR_RAIL_WIDTH = 52;
+const SIDEBAR_DEFAULT_WIDTH = 420;
+const SIDEBAR_MIN_WIDTH = 320;
+const SIDEBAR_MAX_WIDTH = 720;
+const SIDEBAR_MAIN_MIN_WIDTH = 480;
+const SIDEBAR_RESIZE_HANDLE_WIDTH = 5;
+const SIDEBAR_BROWSER_TOP = 146;
+const SIDEBAR_TOOLS = new Set(['review', 'terminal', 'browser', 'files']);
+const WORKSPACE_FILE_LIMIT = 800;
+const WORKSPACE_TEXT_LIMIT = 1024 * 1024;
 const MANAGED_RUNTIME_FS_MAX_RETRIES = 8;
 const MANAGED_RUNTIME_FS_RETRY_DELAY_MS = 100;
 const POWERSHELL_EXPAND_ARCHIVE_COMMAND =
@@ -52,6 +66,8 @@ const POWERSHELL_EXPAND_ARCHIVE_COMMAND =
 
 let mainWindow = null;
 let harnessView = null;
+let harnessViewReady = false;
+let sidebarBrowserView = null;
 let tray = null;
 let dshProcess = null;
 let dshUrl = null;
@@ -68,6 +84,12 @@ let installationCancellationRequested = false;
 let installationClosePromptOpen = false;
 let usingExternalHost = false;
 let isQuitting = false;
+let sidebarOpen = false;
+let sidebarPanelWidth = SIDEBAR_DEFAULT_WIDTH;
+let sidebarActiveTool = 'review';
+let workspaceRoot = process.cwd();
+let navigationPopupMenu = null;
+let modalOverlayOpen = false;
 const managedInstallationProcesses = new Set();
 const managedInstallationDownloads = new Set();
 const intentionalHostStops = new Set();
@@ -84,11 +106,20 @@ class EnvironmentRequirementsError extends Error {
   }
 }
 
+configureUserDataOverride();
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on('second-instance', showMainWindow);
   registerAppLifecycle();
+}
+
+function configureUserDataOverride() {
+  const prefix = '--dsh-user-data-dir=';
+  const argument = process.argv.find((value) => String(value).startsWith(prefix));
+  const directory = argument ? String(argument).slice(prefix.length).trim() : '';
+  if (directory) app.setPath('userData', path.resolve(directory));
 }
 
 function registerAppLifecycle() {
@@ -184,7 +215,7 @@ function createMainWindow() {
     titleBarOverlay: {
       color: '#00000000',
       symbolColor: '#4b5563',
-      height: 38,
+      height: TOP_NAVIGATION_HEIGHT,
     },
     title: 'DeepSeek Harness',
     backgroundColor: '#ffffff',
@@ -201,8 +232,13 @@ function createMainWindow() {
   mainWindow.once('ready-to-show', () => mainWindow?.show());
   mainWindow.webContents.on('did-finish-load', () => {
     mainWindow?.webContents.send('dsh:state', currentServiceState);
+    publishSidebarState();
   });
-  mainWindow.on('resize', layoutHarnessView);
+  registerSidebarShortcut(mainWindow.webContents);
+  mainWindow.on('resize', () => {
+    layoutHarnessView();
+    publishSidebarState();
+  });
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
       event.preventDefault();
@@ -214,6 +250,7 @@ function createMainWindow() {
     }
   });
   mainWindow.on('closed', () => {
+    destroySidebarBrowserView();
     harnessView = null;
     mainWindow = null;
   });
@@ -287,6 +324,420 @@ function registerIpcHandlers() {
     clipboard.writeText(diagnostics);
     return { ok: true };
   });
+
+  ipcMain.handle('dsh:check-environment', async (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return inspectRuntimeEnvironment();
+  });
+
+  ipcMain.handle('dsh:restart', async (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    if (usingExternalHost) return { ok: false, error: '当前连接的是外部 Harness Host，无法由桌面端重启' };
+    return bootstrapHarness();
+  });
+
+  ipcMain.handle('sidebar:get-state', (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return {
+      ok: true,
+      open: sidebarOpen,
+      tool: sidebarActiveTool,
+      width: getSidebarWidth(),
+      panelWidth: getSidebarPanelWidth(),
+      workspace: workspaceRoot,
+    };
+  });
+
+  ipcMain.handle('sidebar:set-open', (event, open) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    sidebarOpen = Boolean(open);
+    layoutHarnessView();
+    publishSidebarState();
+    return { ok: true, open: sidebarOpen, tool: sidebarActiveTool, width: getSidebarWidth(), panelWidth: getSidebarPanelWidth() };
+  });
+
+  ipcMain.handle('sidebar:set-width', (event, width) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    sidebarPanelWidth = clampSidebarPanelWidth(width);
+    layoutHarnessView();
+    publishSidebarState();
+    return { ok: true, open: sidebarOpen, width: getSidebarWidth(), panelWidth: getSidebarPanelWidth() };
+  });
+
+  ipcMain.handle('sidebar:set-tool', (event, tool, options = {}) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    if (!SIDEBAR_TOOLS.has(tool)) return { ok: false, error: '未知的侧边栏功能' };
+    sidebarActiveTool = tool;
+    if (options?.open !== false) sidebarOpen = true;
+    layoutHarnessView();
+    publishSidebarState();
+    return { ok: true, open: sidebarOpen, tool, width: getSidebarWidth(), panelWidth: getSidebarPanelWidth() };
+  });
+
+  ipcMain.handle('workspace:get', (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return { ok: true, path: workspaceRoot, name: path.basename(workspaceRoot) };
+  });
+
+  ipcMain.handle('workspace:choose', async (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: '选择工作区文件夹',
+      defaultPath: workspaceRoot,
+      properties: ['openDirectory'],
+    });
+    if (result.canceled || !result.filePaths[0]) return { ok: false, canceled: true };
+    workspaceRoot = path.resolve(result.filePaths[0]);
+    publishSidebarState();
+    return { ok: true, path: workspaceRoot, name: path.basename(workspaceRoot) };
+  });
+
+  ipcMain.handle('workspace:list-files', async (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    try {
+      return { ok: true, path: workspaceRoot, files: await listWorkspaceFiles(workspaceRoot) };
+    } catch (error) {
+      return { ok: false, error: error.message || String(error) };
+    }
+  });
+
+  ipcMain.handle('workspace:read-file', async (event, relativePath) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    try {
+      return { ok: true, ...(await readWorkspaceFile(relativePath)) };
+    } catch (error) {
+      return { ok: false, error: error.message || String(error) };
+    }
+  });
+
+  ipcMain.handle('review:get', async (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return getWorkspaceReview();
+  });
+
+  ipcMain.handle('terminal:run', async (event, command) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    const sender = event.sender;
+    return runTerminalCommand(command, (stream, text) => {
+      if (!text || sender.isDestroyed()) return;
+      sender.send('terminal:output', { stream, text });
+    });
+  });
+
+  ipcMain.handle('browser:navigate', async (event, target) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    try {
+      const url = normalizeBrowserUrl(target);
+      const view = ensureSidebarBrowserView();
+      await view.webContents.loadURL(url);
+      return { ok: true, url: view.webContents.getURL(), title: view.webContents.getTitle() };
+    } catch (error) {
+      return { ok: false, error: error.message || String(error) };
+    }
+  });
+
+  ipcMain.handle('browser:action', (event, action) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    const view = sidebarBrowserView;
+    if (!view || view.webContents.isDestroyed()) return { ok: false, error: '浏览器尚未打开' };
+    if (action === 'back' && canBrowserGoBack(view.webContents)) goBrowserBack(view.webContents);
+    else if (action === 'forward' && canBrowserGoForward(view.webContents)) goBrowserForward(view.webContents);
+    else if (action === 'reload') view.webContents.reload();
+    else if (action === 'stop') view.webContents.stop();
+    return { ok: true };
+  });
+
+  ipcMain.handle('navigation:action', (event, action) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    const contents = getNavigationContents();
+    if (!contents || contents.isDestroyed()) return { ok: false, error: '当前没有可导航的页面' };
+    if (action === 'back' && canBrowserGoBack(contents)) goBrowserBack(contents);
+    else if (action === 'forward' && canBrowserGoForward(contents)) goBrowserForward(contents);
+    else if (action === 'reload') contents.reload();
+    publishNavigationState();
+    return { ok: true };
+  });
+
+  ipcMain.handle('navigation:edit', (event, action) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    if (action === 'copy') event.sender.copy();
+    else if (action === 'paste') event.sender.paste();
+    else if (action === 'select-all') event.sender.selectAll();
+    else return { ok: false, error: '未知的编辑操作' };
+    return { ok: true };
+  });
+
+  ipcMain.handle('navigation:show-menu', (event, menu, anchor) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return showNavigationMenu(menu, anchor);
+  });
+
+  ipcMain.handle('navigation:close-menu', (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    navigationPopupMenu?.closePopup(mainWindow);
+    return { ok: true };
+  });
+
+  ipcMain.handle('ui:set-modal-open', (event, open) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    modalOverlayOpen = Boolean(open);
+    if (harnessView && !harnessView.webContents.isDestroyed()) {
+      harnessView.setVisible(harnessViewReady && !modalOverlayOpen);
+    }
+    layoutHarnessView();
+    return { ok: true, open: modalOverlayOpen };
+  });
+}
+
+function showNavigationMenu(menuName, anchor = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, error: '主窗口不存在' };
+  const template = createNavigationMenuTemplate(menuName);
+  if (!template) return { ok: false, error: '未知的导航菜单' };
+  navigationPopupMenu?.closePopup(mainWindow);
+  const popup = Menu.buildFromTemplate(template);
+  navigationPopupMenu = popup;
+  const x = Math.max(0, Math.round(Number(anchor.x) || 0));
+  const y = Math.max(TOP_NAVIGATION_HEIGHT, Math.round(Number(anchor.y) || TOP_NAVIGATION_HEIGHT));
+  popup.popup({
+    window: mainWindow,
+    x,
+    y,
+    callback: () => {
+      if (navigationPopupMenu === popup) navigationPopupMenu = null;
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('navigation:menu-closed');
+    },
+  });
+  return { ok: true };
+}
+
+function createNavigationMenuTemplate(menuName) {
+  const action = (label, actionName, accelerator) => ({
+    label,
+    accelerator,
+    registerAccelerator: false,
+    click: () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('navigation:menu-action', actionName);
+      }
+    },
+  });
+  if (menuName === 'file') {
+    return [
+      action('选择工作区…', 'choose-workspace'),
+      action('打开日志目录', 'open-logs'),
+    ];
+  }
+  if (menuName === 'edit') {
+    return [
+      action('复制', 'copy', 'CmdOrCtrl+C'),
+      action('粘贴', 'paste', 'CmdOrCtrl+V'),
+      action('全选', 'select-all', 'CmdOrCtrl+A'),
+    ];
+  }
+  if (menuName === 'view') {
+    return [
+      action('刷新当前页面', 'reload', 'CmdOrCtrl+R'),
+      action('重启 Harness 服务', 'restart-harness'),
+      { type: 'separator' },
+      action('审阅', 'tool-review', 'CmdOrCtrl+Shift+G'),
+      action('终端', 'tool-terminal'),
+      action('浏览器', 'tool-browser', 'CmdOrCtrl+T'),
+      action('文件', 'tool-files', 'CmdOrCtrl+P'),
+      { type: 'separator' },
+      action('切换侧边栏', 'toggle-sidebar', 'CmdOrCtrl+Shift+S'),
+    ];
+  }
+  if (menuName === 'help') {
+    return [
+      action('检查运行环境', 'check-environment'),
+      { type: 'separator' },
+      action('复制诊断信息', 'copy-diagnostics'),
+    ];
+  }
+  return null;
+}
+
+async function listWorkspaceFiles(root) {
+  const ignoredDirectories = new Set(['.git', 'node_modules', 'release', 'dist', 'build', '.next', '.cache']);
+  const entries = [];
+
+  async function visit(directory, depth) {
+    if (entries.length >= WORKSPACE_FILE_LIMIT || depth > 7) return;
+    const children = await fs.promises.readdir(directory, { withFileTypes: true });
+    children.sort((a, b) => {
+      if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+      return a.name.localeCompare(b.name, 'zh-CN');
+    });
+    for (const child of children) {
+      if (entries.length >= WORKSPACE_FILE_LIMIT) break;
+      if (child.name.startsWith('.') && child.name !== '.env.example') continue;
+      if (child.isDirectory() && ignoredDirectories.has(child.name)) continue;
+      const absolutePath = path.join(directory, child.name);
+      const relativePath = path.relative(root, absolutePath).split(path.sep).join('/');
+      const item = { name: child.name, path: relativePath, depth, directory: child.isDirectory() };
+      entries.push(item);
+      if (child.isDirectory() && !child.isSymbolicLink()) await visit(absolutePath, depth + 1);
+    }
+  }
+
+  await visit(root, 0);
+  return entries;
+}
+
+function resolveWorkspacePath(relativePath) {
+  const candidate = path.resolve(workspaceRoot, String(relativePath || ''));
+  const relative = path.relative(path.resolve(workspaceRoot), candidate);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('文件不在当前工作区内');
+  return candidate;
+}
+
+async function readWorkspaceFile(relativePath) {
+  const absolutePath = resolveWorkspacePath(relativePath);
+  const stat = await fs.promises.stat(absolutePath);
+  if (!stat.isFile()) throw new Error('请选择一个文件');
+  if (stat.size > WORKSPACE_TEXT_LIMIT) throw new Error('文件超过 1 MB，无法在侧边栏预览');
+  const buffer = await fs.promises.readFile(absolutePath);
+  if (buffer.includes(0)) throw new Error('二进制文件无法预览');
+  return {
+    path: path.relative(workspaceRoot, absolutePath).split(path.sep).join('/'),
+    content: buffer.toString('utf8'),
+    size: stat.size,
+  };
+}
+
+async function getWorkspaceReview() {
+  const status = await runWorkspaceProcess('git.exe', ['status', '--short', '--branch'], 20_000);
+  if (status.code !== 0) {
+    return { ok: false, error: status.stderr.trim() || '当前工作区不是 Git 仓库，或未安装 Git' };
+  }
+  const [unstaged, staged] = await Promise.all([
+    runWorkspaceProcess('git.exe', ['-c', 'color.ui=false', 'diff', '--no-ext-diff', '--unified=3'], 30_000),
+    runWorkspaceProcess('git.exe', ['-c', 'color.ui=false', 'diff', '--cached', '--no-ext-diff', '--unified=3'], 30_000),
+  ]);
+  return {
+    ok: true,
+    status: status.stdout.trim(),
+    diff: [
+      staged.stdout.trim() ? `# 已暂存\n${staged.stdout.trim()}` : '',
+      unstaged.stdout.trim() ? `# 未暂存\n${unstaged.stdout.trim()}` : '',
+    ].filter(Boolean).join('\n\n'),
+  };
+}
+
+async function runTerminalCommand(command, onOutput = null) {
+  const value = String(command || '').trim();
+  if (!value) return { ok: false, error: '请输入命令' };
+  if (value.length > 4_000) return { ok: false, error: '命令过长' };
+  const preparedCommand = prepareTerminalCommand(value);
+  const encodedCommand = Buffer.from(value, 'utf8').toString('base64');
+  const nativeEncodingExpression = preparedCommand.utf8NativeOutput
+    ? '[System.Text.UTF8Encoding]::new($false)'
+    : '[System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)';
+  const utf8Command = [
+    `$nativeEncoding = ${nativeEncodingExpression};`,
+    '[Console]::InputEncoding = $nativeEncoding;',
+    '[Console]::OutputEncoding = $nativeEncoding;',
+    '$OutputEncoding = $nativeEncoding;',
+    '$nativeExitCode = 0;',
+    '$LASTEXITCODE = $null;',
+    'try {',
+    `$script = [scriptblock]::Create([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedCommand}')));`,
+    '& $script;',
+    'if ($null -ne $LASTEXITCODE) { $nativeExitCode = $LASTEXITCODE }',
+    '} catch {',
+    '[Console]::Error.Write(($_ | Out-String -Width 4096));',
+    '$nativeExitCode = 1;',
+    '}',
+    'exit $nativeExitCode;',
+  ].join(' ');
+  const result = await runWorkspaceProcess(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', utf8Command],
+    120_000,
+    {
+      encoding: preparedCommand.utf8NativeOutput ? 'utf8' : 'oem',
+      onOutput,
+    },
+  );
+  return {
+    ok: true,
+    code: result.code,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    streamed: Boolean(onOutput),
+    cwd: workspaceRoot,
+  };
+}
+
+function prepareTerminalCommand(command) {
+  return {
+    utf8NativeOutput: /^(?:dsh|node|npm|npx|pnpm)(?:\.cmd|\.ps1|\.exe)?(?:\s|$)/i.test(command),
+  };
+}
+
+function runWorkspaceProcess(executable, args, timeoutMs, options = {}) {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timer = null;
+    const stdoutDecoder = createTerminalDecoder(options.encoding);
+    const stderrDecoder = createTerminalDecoder(options.encoding);
+    const managedNodeDirectory = getManagedNodeDirectory();
+    const env = {
+      ...process.env,
+      PATH: fs.existsSync(managedNodeDirectory)
+        ? `${managedNodeDirectory}${path.delimiter}${process.env.PATH || ''}`
+        : process.env.PATH,
+    };
+    const child = spawn(executable, args, {
+      cwd: workspaceRoot,
+      env,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const emitOutput = (stream, text) => {
+      if (!text) return;
+      if (stream === 'stdout') stdout += text;
+      else stderr += text;
+      options.onOutput?.(stream, text);
+    };
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      emitOutput('stdout', stdoutDecoder.decode());
+      emitOutput('stderr', stderrDecoder.decode());
+      resolve({ code, stdout: stdout.slice(-WORKSPACE_TEXT_LIMIT), stderr: stderr.slice(-WORKSPACE_TEXT_LIMIT) });
+    };
+    child.stdout.on('data', (chunk) => emitOutput('stdout', stdoutDecoder.decode(chunk, { stream: true })));
+    child.stderr.on('data', (chunk) => emitOutput('stderr', stderrDecoder.decode(chunk, { stream: true })));
+    child.once('error', (error) => { stderr += error.message; finish(-1); });
+    child.once('close', (code) => finish(code ?? -1));
+    timer = setTimeout(() => {
+      stderr += `\n命令执行超时（${Math.round(timeoutMs / 1000)} 秒）`;
+      void terminateProcessTree(child).finally(() => finish(-1));
+    }, timeoutMs);
+  });
+}
+
+function createTerminalDecoder(encoding) {
+  if (encoding !== 'oem') return new TextDecoder('utf-8');
+  const locale = String(Intl.DateTimeFormat().resolvedOptions().locale || '').toLowerCase();
+  if (locale.startsWith('zh')) return new TextDecoder('gbk');
+  if (locale.startsWith('ja')) return new TextDecoder('shift_jis');
+  if (locale.startsWith('ko')) return new TextDecoder('euc-kr');
+  if (locale.startsWith('ru') || locale.startsWith('uk')) return new TextDecoder('ibm866');
+  return new TextDecoder('windows-1252');
+}
+
+function normalizeBrowserUrl(target) {
+  const raw = String(target || '').trim();
+  if (!raw) return 'https://www.bing.com/';
+  const withProtocol = /^[a-z][a-z\d+.-]*:/i.test(raw) ? raw : `https://${raw}`;
+  const parsed = new URL(withProtocol);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('仅支持 HTTP 或 HTTPS 地址');
+  return parsed.href;
 }
 
 function initializeLogging() {
@@ -386,6 +837,55 @@ async function createDiagnosticReport() {
   ].join('\r\n');
 }
 
+async function inspectRuntimeEnvironment() {
+  const items = [];
+  let runtime = null;
+  try {
+    const runtimes = await findNpmRuntimes();
+    runtime = runtimes.find((candidate) => candidate.major >= MIN_NODE_MAJOR) || null;
+  } catch (error) {
+    items.push({ name: 'Node.js / npm', ok: false, detail: `检测失败：${error.message || error}` });
+  }
+  if (!runtime) {
+    if (!items.length) {
+      items.push({ name: 'Node.js', ok: false, detail: `未检测到兼容版本（最低 v${MIN_NODE_MAJOR}）` });
+      items.push({ name: 'npm', ok: false, detail: '未检测' });
+    }
+    items.push({ name: 'dsh', ok: false, detail: `未检测（需要 ${DSH_REQUIRED_VERSION}）` });
+    items.push({ name: 'pnpm', ok: false, detail: `未检测（最低 v${MIN_PNPM_MAJOR}）` });
+    return { ok: false, items };
+  }
+
+  items.push({ name: 'Node.js', ok: true, detail: `${runtime.version}（${runtime.node}）` });
+  items.push({ name: 'npm', ok: true, detail: runtime.npmVersion });
+  let dsh = null;
+  try {
+    const npmRoot = await getGlobalNpmRoot(runtime);
+    const packageRoots = [
+      path.join(app.getPath('home'), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh'),
+      path.join(npmRoot, '@deepseek-ai', 'dsh'),
+    ];
+    for (const packageRoot of packageRoots) {
+      dsh = await validateDshInstallation(runtime.node, packageRoot);
+      if (dsh) break;
+    }
+  } catch (error) {
+    console.error('[environment] dsh 检查失败', error);
+  }
+  items.push({
+    name: 'dsh',
+    ok: Boolean(dsh),
+    detail: dsh ? `${dsh.version}（${dsh.cli}）` : `未检测到要求版本 ${DSH_REQUIRED_VERSION}`,
+  });
+  const pnpm = await validatePnpmInstallation(runtime);
+  items.push({
+    name: 'pnpm',
+    ok: Boolean(pnpm),
+    detail: pnpm ? `${pnpm.version}（${pnpm.command}）` : `未检测到兼容版本（最低 v${MIN_PNPM_MAJOR}）`,
+  });
+  return { ok: items.every((item) => item.ok), items };
+}
+
 function createAppIcon() {
   return nativeImage.createFromPath(path.join(__dirname, 'build', 'icon.ico'));
 }
@@ -409,12 +909,18 @@ async function loadOfficialHarnessUi(url) {
 
   harnessView = new WebContentsView({
     webPreferences: {
+      preload: path.join(__dirname, 'harness-preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
   });
   const view = harnessView;
+  harnessViewReady = false;
+  registerSidebarShortcut(view.webContents);
+  for (const eventName of ['did-start-loading', 'did-stop-loading', 'did-navigate', 'did-navigate-in-page']) {
+    view.webContents.on(eventName, () => publishNavigationState());
+  }
   view.setVisible(false);
   mainWindow.contentView.addChildView(view);
   layoutHarnessView();
@@ -440,43 +946,8 @@ async function loadOfficialHarnessUi(url) {
   });
   await loadHarnessUrlWithRetry(view, url);
   if (harnessView !== view || view.webContents.isDestroyed()) throw new Error('Harness 页面加载已取消');
-  await view.webContents.insertCSS(`
-    html::before {
-      -webkit-app-region: drag;
-      content: "";
-      position: fixed;
-      z-index: 2147483647;
-      top: 0;
-      left: 280px;
-      right: 145px;
-      height: 32px;
-    }
-  `);
-  await view.webContents.executeJavaScript(`
-    (() => {
-      const shiftSessionLog = () => {
-        const controls = document.querySelectorAll('button, a, [role="button"]');
-        for (const control of controls) {
-          const label = [
-            control.textContent,
-            control.getAttribute('aria-label'),
-            control.getAttribute('title'),
-          ].filter(Boolean).join(' ').trim();
-          if (!/session\\s*log/i.test(label)) continue;
-          control.style.setProperty('position', 'relative', 'important');
-          control.style.setProperty('top', '28px', 'important');
-          control.style.setProperty('z-index', '2147483646', 'important');
-        }
-      };
-
-      shiftSessionLog();
-      new MutationObserver(shiftSessionLog).observe(document.body, {
-        childList: true,
-        subtree: true,
-      });
-    })();
-  `);
-  view.setVisible(true);
+  harnessViewReady = true;
+  view.setVisible(!modalOverlayOpen);
 }
 
 async function loadHarnessUrlWithRetry(view, url) {
@@ -506,6 +977,7 @@ async function loadHarnessUrlWithRetry(view, url) {
 function destroyHarnessView() {
   const view = harnessView;
   harnessView = null;
+  harnessViewReady = false;
   if (!view) return;
   try {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.contentView.removeChildView(view);
@@ -515,14 +987,193 @@ function destroyHarnessView() {
   } catch {}
 }
 
+function ensureSidebarBrowserView() {
+  if (sidebarBrowserView && !sidebarBrowserView.webContents.isDestroyed()) return sidebarBrowserView;
+  if (!mainWindow || mainWindow.isDestroyed()) throw new Error('主窗口不存在');
+  sidebarBrowserView = new WebContentsView({
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  const view = sidebarBrowserView;
+  registerSidebarShortcut(view.webContents);
+  view.setBackgroundColor('#ffffff');
+  view.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const target = normalizeBrowserUrl(url);
+      void view.webContents.loadURL(target);
+    } catch {}
+    return { action: 'deny' };
+  });
+  for (const eventName of ['did-start-loading', 'did-stop-loading', 'did-navigate', 'did-navigate-in-page', 'page-title-updated']) {
+    view.webContents.on(eventName, () => {
+      publishBrowserState();
+      publishNavigationState();
+    });
+  }
+  view.webContents.on('did-fail-load', (_event, code, description, validatedURL, isMainFrame) => {
+    if (isMainFrame) publishBrowserState({ error: `${description} (${code})`, url: validatedURL });
+  });
+  mainWindow.contentView.addChildView(view);
+  layoutHarnessView();
+  return view;
+}
+
+function destroySidebarBrowserView() {
+  const view = sidebarBrowserView;
+  sidebarBrowserView = null;
+  if (!view) return;
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.contentView.removeChildView(view);
+  } catch {}
+  try {
+    if (!view.webContents.isDestroyed()) view.webContents.close();
+  } catch {}
+}
+
+function publishBrowserState(details = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const contents = sidebarBrowserView?.webContents;
+  mainWindow.webContents.send('browser:state', {
+    url: contents && !contents.isDestroyed() ? contents.getURL() : '',
+    title: contents && !contents.isDestroyed() ? contents.getTitle() : '',
+    loading: Boolean(contents && !contents.isDestroyed() && contents.isLoading()),
+    canGoBack: Boolean(contents && !contents.isDestroyed() && canBrowserGoBack(contents)),
+    canGoForward: Boolean(contents && !contents.isDestroyed() && canBrowserGoForward(contents)),
+    ...details,
+  });
+}
+
+function canBrowserGoBack(contents) {
+  return contents.navigationHistory?.canGoBack?.() ?? contents.canGoBack?.() ?? false;
+}
+
+function getNavigationContents() {
+  if (
+    sidebarOpen
+    && sidebarActiveTool === 'browser'
+    && sidebarBrowserView
+    && !sidebarBrowserView.webContents.isDestroyed()
+  ) return sidebarBrowserView.webContents;
+  if (harnessView && !harnessView.webContents.isDestroyed()) return harnessView.webContents;
+  return null;
+}
+
+function publishNavigationState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const contents = getNavigationContents();
+  mainWindow.webContents.send('navigation:state', {
+    canGoBack: Boolean(contents && canBrowserGoBack(contents)),
+    canGoForward: Boolean(contents && canBrowserGoForward(contents)),
+    loading: Boolean(contents && contents.isLoading()),
+  });
+}
+
+function canBrowserGoForward(contents) {
+  return contents.navigationHistory?.canGoForward?.() ?? contents.canGoForward?.() ?? false;
+}
+
+function goBrowserBack(contents) {
+  if (contents.navigationHistory?.goBack) contents.navigationHistory.goBack();
+  else contents.goBack?.();
+}
+
+function goBrowserForward(contents) {
+  if (contents.navigationHistory?.goForward) contents.navigationHistory.goForward();
+  else contents.goForward?.();
+}
+
 function layoutHarnessView() {
-  if (!mainWindow || !harnessView) return;
+  if (!mainWindow) return;
   const [width, height] = mainWindow.getContentSize();
-  harnessView.setBounds({
-    x: 0,
-    y: 0,
-    width: Math.max(0, width),
-    height: Math.max(0, height),
+  const sidebarWidth = getSidebarWidth();
+  if (harnessView) {
+    harnessView.setBounds({
+      x: 0,
+      y: TOP_NAVIGATION_HEIGHT,
+      width: Math.max(0, width - sidebarWidth),
+      height: Math.max(0, height - TOP_NAVIGATION_HEIGHT),
+    });
+  }
+  if (sidebarBrowserView && !sidebarBrowserView.webContents.isDestroyed()) {
+    const browserVisible = !modalOverlayOpen && sidebarOpen && sidebarActiveTool === 'browser';
+    sidebarBrowserView.setVisible(browserVisible);
+    if (browserVisible) {
+      const panelWidth = getSidebarPanelWidth();
+      sidebarBrowserView.setBounds({
+        x: Math.max(0, width - panelWidth + SIDEBAR_RESIZE_HANDLE_WIDTH),
+        y: SIDEBAR_BROWSER_TOP,
+        width: Math.max(0, panelWidth - SIDEBAR_RAIL_WIDTH - SIDEBAR_RESIZE_HANDLE_WIDTH),
+        height: Math.max(0, height - SIDEBAR_BROWSER_TOP),
+      });
+    }
+  }
+}
+
+function getSidebarWidth() {
+  return sidebarOpen ? getSidebarPanelWidth() : SIDEBAR_RAIL_WIDTH;
+}
+
+function getSidebarPanelWidth() {
+  if (!mainWindow || mainWindow.isDestroyed()) return clampSidebarPanelWidth(sidebarPanelWidth, false);
+  const [windowWidth] = mainWindow.getContentSize();
+  return Math.min(
+    clampSidebarPanelWidth(sidebarPanelWidth, false),
+    Math.max(SIDEBAR_MIN_WIDTH, windowWidth - SIDEBAR_MAIN_MIN_WIDTH),
+  );
+}
+
+function clampSidebarPanelWidth(width, respectWindow = true) {
+  const numericWidth = Number(width);
+  let maximum = SIDEBAR_MAX_WIDTH;
+  if (respectWindow && mainWindow && !mainWindow.isDestroyed()) {
+    const [windowWidth] = mainWindow.getContentSize();
+    maximum = Math.min(maximum, Math.max(SIDEBAR_MIN_WIDTH, windowWidth - SIDEBAR_MAIN_MIN_WIDTH));
+  }
+  if (!Number.isFinite(numericWidth)) return SIDEBAR_DEFAULT_WIDTH;
+  return Math.round(Math.min(maximum, Math.max(SIDEBAR_MIN_WIDTH, numericWidth)));
+}
+
+function publishSidebarState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('sidebar:state', {
+    open: sidebarOpen,
+    tool: sidebarActiveTool,
+    width: getSidebarWidth(),
+    panelWidth: getSidebarPanelWidth(),
+    workspace: workspaceRoot,
+  });
+  publishNavigationState();
+}
+
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  layoutHarnessView();
+  publishSidebarState();
+}
+
+function registerSidebarShortcut(webContents) {
+  webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown' || input.isAutoRepeat) return;
+    const key = String(input.key).toLowerCase();
+    if (input.control && input.shift && key === 's') {
+      event.preventDefault();
+      toggleSidebar();
+      return;
+    }
+    let tool = null;
+    if (input.control && input.shift && key === 'g') tool = 'review';
+    else if (input.control && !input.shift && (key === '`' || key === 'backquote')) tool = 'terminal';
+    else if (input.control && !input.shift && key === 't') tool = 'browser';
+    else if (input.control && !input.shift && key === 'p') tool = 'files';
+    if (!tool) return;
+    event.preventDefault();
+    sidebarActiveTool = tool;
+    sidebarOpen = true;
+    layoutHarnessView();
+    publishSidebarState();
   });
 }
 
@@ -746,6 +1397,12 @@ async function ensureGlobalDsh(options = {}) {
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(DSH_REQUIRED_VERSION || '')) {
     throw new Error(`package.json 中的 ${DSH_PACKAGE_NAME} 版本无效`);
   }
+  if (!/^\d+\.\d+\.\d+$/.test(PNPM_REQUIRED_VERSION || '')) {
+    throw new Error('package.json 中的 dshRuntime.pnpmVersion 无效');
+  }
+  if (!Number.isInteger(MIN_PNPM_MAJOR) || MIN_PNPM_MAJOR < 8) {
+    throw new Error('package.json 中的 dshRuntime.minimumPnpmMajor 无效');
+  }
   if (!Number.isInteger(MIN_NODE_MAJOR) || MIN_NODE_MAJOR < 20) {
     throw new Error('package.json 中的 dshRuntime.minimumNodeMajor 无效');
   }
@@ -846,7 +1503,10 @@ async function ensureGlobalDsh(options = {}) {
   ];
   for (const packageRoot of packageRoots) {
     const validated = await validateDshInstallation(npmRuntime.node, packageRoot);
-    if (validated) return validated;
+    if (validated) {
+      await repairPnpmIfNeeded(npmRuntime);
+      return validated;
+    }
   }
 
   if (!approvedRequirements.has('dsh')) {
@@ -870,7 +1530,116 @@ async function ensureGlobalDsh(options = {}) {
   if (!validated) {
     throw new Error(`dsh 安装完成，但版本或 CLI 健康检查未通过：${packageRoot}`);
   }
+  await repairPnpmIfNeeded(npmRuntime);
   return validated;
+}
+
+async function repairPnpmIfNeeded(runtime) {
+  try {
+    return await ensurePnpmAvailable(runtime);
+  } catch (error) {
+    console.error(`[install] pnpm 自动修复失败，不阻止 Harness 启动：${error.message || error}`);
+    return null;
+  }
+}
+
+async function ensurePnpmAvailable(runtime) {
+  const installed = await validatePnpmInstallation(runtime);
+  if (installed) return installed;
+  await withInstallationSession(() => installPnpmWithRegistryFallback(runtime));
+  const repaired = await validatePnpmInstallation(runtime);
+  if (!repaired) {
+    throw new Error(`pnpm ${PNPM_REQUIRED_VERSION} 安装完成，但健康检查未通过`);
+  }
+  return repaired;
+}
+
+async function validatePnpmInstallation(runtime) {
+  try {
+    const npmRoot = await getGlobalNpmRoot(runtime);
+    const packageRoot = path.join(npmRoot, 'pnpm');
+    const packageFile = path.join(packageRoot, 'package.json');
+    const command = path.join(path.dirname(npmRoot), 'pnpm.cmd');
+    if (!fs.existsSync(packageFile) || !fs.existsSync(command)) return null;
+    const metadata = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+    const pnpmVersion = parseNodeVersion(metadata.version);
+    if (metadata.name !== 'pnpm' || !pnpmVersion || pnpmVersion.major < MIN_PNPM_MAJOR) return null;
+    const configuredBin = typeof metadata.bin === 'string' ? metadata.bin : metadata.bin?.pnpm;
+    const cli = path.resolve(packageRoot, configuredBin || path.join('bin', 'pnpm.cjs'));
+    if (!fs.existsSync(cli)) return null;
+    const versionCheck = await runProcess(
+      runtime.node,
+      [cli, '--version'],
+      30_000,
+      false,
+      false,
+      createRuntimeProcessEnvironment(runtime),
+    );
+    const version = versionCheck.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
+    const reportedVersion = parseNodeVersion(version);
+    if (versionCheck.code !== 0 || !reportedVersion || reportedVersion.major < MIN_PNPM_MAJOR) return null;
+    console.log(`[install] pnpm 健康检查通过：${version} (${command})`);
+    return { version, command, cli };
+  } catch (error) {
+    console.error('[install] 无法校验 pnpm', error);
+    return null;
+  }
+}
+
+async function installPnpmWithRegistryFallback(runtime) {
+  const registries = await getNpmRegistryCandidates(runtime);
+  const failures = [];
+  for (let registryIndex = 0; registryIndex < registries.length; registryIndex += 1) {
+    const registry = registries[registryIndex];
+    const registryLabel = formatRegistryLabel(registry);
+    for (let attempt = 1; attempt <= DSH_INSTALL_ATTEMPTS_PER_REGISTRY; attempt += 1) {
+      const attemptText = DSH_INSTALL_ATTEMPTS_PER_REGISTRY > 1
+        ? `，第 ${attempt}/${DSH_INSTALL_ATTEMPTS_PER_REGISTRY} 次`
+        : '';
+      publishServiceState(
+        'installing',
+        `正在安装 ${PNPM_NPM_SPEC}（${registryLabel}${attemptText}）…`,
+      );
+      const installArguments = [
+        runtime.cli,
+        'install', '-g', PNPM_NPM_SPEC,
+        `--registry=${registry}`,
+        '--no-audit', '--no-fund', '--loglevel=error',
+        '--fetch-retries=1',
+        '--fetch-retry-mintimeout=1000',
+        '--fetch-retry-maxtimeout=10000',
+        '--fetch-timeout=60000',
+      ];
+      if (runtime.managed) installArguments.push(`--prefix=${runtime.root}`);
+      const result = await runProcess(
+        runtime.node,
+        installArguments,
+        DSH_INSTALL_TIMEOUT_MS,
+        true,
+        true,
+        createRuntimeProcessEnvironment(runtime),
+      );
+      if (result.cancelled) throw new Error('pnpm 安装已取消');
+      if (result.code === 0) {
+        console.log(`[install] ${PNPM_NPM_SPEC} 安装成功，来源：${registryLabel}`);
+        return registry;
+      }
+      const detail = tail(result.stderr || result.stdout, 400);
+      failures.push(`${registryLabel}（第 ${attempt} 次）：${detail}`);
+      console.error(
+        `[install] ${PNPM_NPM_SPEC} 安装失败，来源：${registryLabel}，`
+        + `attempt=${attempt}，code=${result.code}：${detail}`,
+      );
+      if (attempt < DSH_INSTALL_ATTEMPTS_PER_REGISTRY) {
+        publishServiceState('installing', `${registryLabel} 安装 pnpm 失败，正在重试…`);
+        await delay(1_000 * attempt);
+      }
+    }
+    if (registryIndex < registries.length - 1) {
+      publishServiceState('installing', `${registryLabel} 不可用，正在切换 pnpm 安装源…`);
+    }
+  }
+  throw new Error(`pnpm 自动安装失败，所有安装源均不可用：${tail(failures.join('\n'), 1_200)}`);
 }
 
 async function installDshWithRegistryFallback(runtime) {

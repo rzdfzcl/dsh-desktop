@@ -2,15 +2,58 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta
-      http-equiv="Content-Security-Policy"
-      content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:"
-    />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>DeepSeek Harness</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
-  <body>
+  <body data-sidebar-open="false">
+    <header id="top-navigation" class="top-navigation" aria-label="应用导航栏">
+      <div id="harness-service-status" class="harness-service-status" data-state="starting" role="status" aria-live="polite" title="正在启动 DeepSeek Harness">
+        <span class="harness-status-dot" aria-hidden="true"></span>
+        <span id="harness-status-label">Harness 启动中</span>
+      </div>
+      <nav class="application-menu" aria-label="应用菜单">
+        <div class="top-menu">
+          <button class="top-menu-button" type="button" data-top-menu="file" aria-haspopup="menu" aria-expanded="false">文件</button>
+          <div class="top-menu-popover" data-top-menu-popover="file" role="menu" hidden>
+            <button type="button" role="menuitem" data-top-action="choose-workspace"><span>选择工作区…</span></button>
+            <button type="button" role="menuitem" data-top-action="open-logs"><span>打开日志目录</span></button>
+          </div>
+        </div>
+        <div class="top-menu">
+          <button class="top-menu-button" type="button" data-top-menu="edit" aria-haspopup="menu" aria-expanded="false">编辑</button>
+          <div class="top-menu-popover" data-top-menu-popover="edit" role="menu" hidden>
+            <button type="button" role="menuitem" data-top-action="copy"><span>复制</span><kbd>Ctrl+C</kbd></button>
+            <button type="button" role="menuitem" data-top-action="paste"><span>粘贴</span><kbd>Ctrl+V</kbd></button>
+            <button type="button" role="menuitem" data-top-action="select-all"><span>全选</span><kbd>Ctrl+A</kbd></button>
+          </div>
+        </div>
+        <div class="top-menu">
+          <button class="top-menu-button" type="button" data-top-menu="view" aria-haspopup="menu" aria-expanded="false">视图</button>
+          <div class="top-menu-popover" data-top-menu-popover="view" role="menu" hidden>
+            <button type="button" role="menuitem" data-top-action="reload"><span>刷新当前页面</span><kbd>Ctrl+R</kbd></button>
+            <button type="button" role="menuitem" data-top-action="restart-harness"><span>重启 Harness 服务</span></button>
+            <div class="top-menu-separator" role="separator"></div>
+            <button type="button" role="menuitem" data-top-action="tool-review"><span>审阅</span><kbd>Ctrl+Shift+G</kbd></button>
+            <button type="button" role="menuitem" data-top-action="tool-terminal"><span>终端</span><kbd>Ctrl+`</kbd></button>
+            <button type="button" role="menuitem" data-top-action="tool-browser"><span>浏览器</span><kbd>Ctrl+T</kbd></button>
+            <button type="button" role="menuitem" data-top-action="tool-files"><span>文件</span><kbd>Ctrl+P</kbd></button>
+            <div class="top-menu-separator" role="separator"></div>
+            <button type="button" role="menuitem" data-top-action="toggle-sidebar"><span>切换侧边栏</span><kbd>Ctrl+Shift+S</kbd></button>
+          </div>
+        </div>
+        <div class="top-menu">
+          <button class="top-menu-button" type="button" data-top-menu="help" aria-haspopup="menu" aria-expanded="false">帮助</button>
+          <div class="top-menu-popover" data-top-menu-popover="help" role="menu" hidden>
+            <button type="button" role="menuitem" data-top-action="check-environment"><span>检查运行环境</span></button>
+            <div class="top-menu-separator" role="separator"></div>
+            <button type="button" role="menuitem" data-top-action="copy-diagnostics"><span>复制诊断信息</span></button>
+          </div>
+        </div>
+      </nav>
+    </header>
+
     <main class="splash" aria-live="polite">
       <img class="splash-icon" src="../build/icon.ico" alt="" draggable="false" />
       <h1>DeepSeek Harness</h1>
@@ -28,6 +71,113 @@
       </div>
       <span id="action-feedback" role="status"></span>
     </main>
+
+    <aside id="app-sidebar" class="app-sidebar" data-open="false" data-tool="review" aria-label="工作区侧边栏">
+      <div
+        id="sidebar-resizer"
+        class="sidebar-resizer"
+        role="separator"
+        tabindex="0"
+        aria-label="调整侧边栏宽度"
+        aria-orientation="vertical"
+        aria-valuemin="320"
+        aria-valuemax="720"
+        aria-valuenow="420"
+        title="拖动调整宽度，双击恢复默认宽度"
+      ><span></span></div>
+      <div class="sidebar-rail">
+        <button id="sidebar-toggle" class="rail-button sidebar-toggle" type="button" aria-label="展开侧边栏" aria-expanded="false" title="切换侧边栏（Ctrl+Shift+S）">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="3"></rect><path d="M15.5 5v14"></path></svg>
+        </button>
+        <nav class="rail-navigation" aria-label="工作区工具">
+          <button class="rail-button is-active" type="button" data-sidebar-tool="review" title="审阅（Ctrl+Shift+G）">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"></rect><path d="M8 9h8M8 13h5M8 17h7"></path></svg><span class="sr-only">审阅</span>
+          </button>
+          <button class="rail-button" type="button" data-sidebar-tool="terminal" title="终端（Ctrl+`）">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="3"></rect><path d="m7.5 10 2 2-2 2M12.5 15h4"></path></svg><span class="sr-only">终端</span>
+          </button>
+          <button class="rail-button" type="button" data-sidebar-tool="browser" title="浏览器（Ctrl+T）">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"></circle><path d="M3.8 12h16.4M12 3.5c2.2 2.3 3.3 5.2 3.3 8.5S14.2 18.2 12 20.5C9.8 18.2 8.7 15.3 8.7 12S9.8 5.8 12 3.5z"></path></svg><span class="sr-only">浏览器</span>
+          </button>
+          <button class="rail-button" type="button" data-sidebar-tool="files" title="文件（Ctrl+P）">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h6l1.7 2H20.5v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"></path><path d="M6 7.5V5.8A1.8 1.8 0 0 1 7.8 4h4.7"></path></svg><span class="sr-only">文件</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="sidebar-panel">
+        <header class="sidebar-header">
+          <div class="tool-heading"><strong id="sidebar-tool-title">审阅</strong><span id="workspace-path">正在读取工作区…</span></div>
+          <button id="choose-workspace" class="icon-button" type="button" title="选择工作区" aria-label="选择工作区">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h6l1.7 2H20.5v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"></path><path d="M12 13v4M10 15h4"></path></svg>
+          </button>
+        </header>
+
+        <section class="tool-panel is-active" data-tool-panel="review" aria-label="审阅">
+          <div class="panel-toolbar"><span id="review-summary">工作区更改</span><button id="refresh-review" class="text-button" type="button">刷新</button></div>
+          <pre id="review-status" class="review-status">正在读取 Git 状态…</pre>
+          <div id="review-diff" class="diff-view empty-state">暂无可审阅的更改</div>
+        </section>
+
+        <section class="tool-panel" data-tool-panel="terminal" aria-label="终端">
+          <div class="terminal-bar"><span class="terminal-dot"></span><span>PowerShell</span><button id="clear-terminal" type="button">清空</button></div>
+          <div id="terminal-console" class="terminal-console" aria-label="PowerShell 终端">
+            <pre id="terminal-output" class="terminal-output">DeepSeek Harness 终端</pre>
+            <div class="terminal-command-line">
+              <span id="terminal-prompt" class="terminal-prompt">PS&gt;</span>
+              <span
+                id="terminal-input"
+                class="terminal-input"
+                contenteditable="plaintext-only"
+                role="textbox"
+                aria-label="输入命令"
+                aria-multiline="false"
+                data-placeholder="输入命令后按 Enter"
+                spellcheck="false"
+              ></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="tool-panel browser-panel" data-tool-panel="browser" aria-label="浏览器">
+          <form id="browser-form" class="browser-toolbar">
+            <button type="button" data-browser-action="back" title="后退" aria-label="后退">←</button><button type="button" data-browser-action="forward" title="前进" aria-label="前进">→</button><button type="button" data-browser-action="reload" title="刷新" aria-label="刷新">↻</button><input id="browser-address" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="输入网址" />
+          </form>
+          <div id="browser-placeholder" class="browser-placeholder">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"></circle><path d="M3.8 12h16.4M12 3.5c2.2 2.3 3.3 5.2 3.3 8.5S14.2 18.2 12 20.5C9.8 18.2 8.7 15.3 8.7 12S9.8 5.8 12 3.5z"></path></svg><span>在地址栏输入网址开始浏览</span>
+          </div>
+        </section>
+
+        <section class="tool-panel files-panel" data-tool-panel="files" aria-label="文件">
+          <div class="panel-toolbar"><span>资源管理器</span><button id="refresh-files" class="text-button" type="button">刷新</button></div>
+          <div id="file-tree" class="file-tree"><div class="empty-state">正在读取文件…</div></div>
+          <div class="file-preview-header"><span id="file-preview-name">选择文件以预览</span></div>
+          <pre id="file-preview" class="file-preview empty-state">文件内容会显示在这里</pre>
+        </section>
+      </div>
+    </aside>
+
+    <div id="sidebar-toast" class="sidebar-toast" role="status" aria-live="polite"></div>
+
+    <div id="environment-dialog" class="modal-backdrop" hidden>
+      <section id="environment-dialog-panel" class="environment-dialog" role="dialog" aria-modal="true" aria-labelledby="environment-dialog-title" aria-describedby="environment-dialog-summary" tabindex="-1">
+        <header class="environment-dialog-header">
+          <div class="environment-dialog-heading">
+            <span id="environment-dialog-icon" class="environment-dialog-icon" aria-hidden="true">✓</span>
+            <div>
+              <h2 id="environment-dialog-title">运行环境检查</h2>
+              <p id="environment-dialog-summary">正在检查运行环境…</p>
+            </div>
+          </div>
+          <button id="environment-dialog-close" class="modal-close-button" type="button" aria-label="关闭运行环境检查" title="关闭">×</button>
+        </header>
+        <div id="environment-dialog-list" class="environment-dialog-list"></div>
+        <footer class="environment-dialog-footer">
+          <span>DeepSeek Harness Desktop</span>
+          <button id="environment-dialog-done" class="modal-done-button" type="button">完成</button>
+        </footer>
+      </section>
+    </div>
     <script src="./renderer.js"></script>
   </body>
 </html>

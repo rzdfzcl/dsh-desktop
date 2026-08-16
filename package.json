@@ -9,6 +9,8 @@
   "dshRuntime": {
     "packageName": "@deepseek-ai/dsh",
     "version": "0.1.0-rc.6",
+    "pnpmVersion": "11.1.2",
+    "minimumPnpmMajor": 10,
     "minimumNodeMajor": 20,
     "preferredNodeVersion": "24.19.0",
     "preferredNodeSha256": "57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73"
@@ -37,6 +39,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "harness-preload.js",
       "renderer/**/*",
       "build/icon.ico",
       "package.json"
