@@ -88,6 +88,9 @@ function Get-DependencyFingerprint {
     optionalDependencies = if ($metadata.PSObject.Properties.Name -contains 'optionalDependencies') {
       $metadata.optionalDependencies
     } else { $null }
+    allowScripts = if ($metadata.PSObject.Properties.Name -contains 'allowScripts') {
+      $metadata.allowScripts
+    } else { $null }
   } | ConvertTo-Json -Compress
   $nodeVersion = (& $nodeCommand.Source --version | Out-String).Trim()
   $npmVersion = (& $script:npmCommand --version | Out-String).Trim()
@@ -105,7 +108,7 @@ function Test-DependencyCache {
   param([Parameter(Mandatory)][string]$Fingerprint)
 
   $requiredFiles = @(
-    (Join-Path $projectRoot 'node_modules\electron\package.json'),
+    (Join-Path $projectRoot 'node_modules\electron\dist\electron.exe'),
     (Join-Path $projectRoot 'node_modules\electron-builder\package.json')
   )
   if ($requiredFiles | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }) {
@@ -132,6 +135,28 @@ function Save-DependencyCache {
   } | ConvertTo-Json | Set-Content -LiteralPath $dependencyStateFile -Encoding UTF8
 }
 
+function Install-ElectronRuntime {
+  $electronRoot = Join-Path $projectRoot 'node_modules\electron'
+  $electronInstaller = Join-Path $electronRoot 'install.js'
+  $electronExecutable = Join-Path $electronRoot 'dist\electron.exe'
+
+  if (Test-Path -LiteralPath $electronExecutable -PathType Leaf) {
+    return
+  }
+  if (-not (Test-Path -LiteralPath $electronInstaller -PathType Leaf)) {
+    throw "Electron installer not found: $electronInstaller"
+  }
+
+  Write-Host 'Downloading Electron runtime...' -ForegroundColor Cyan
+  & $nodeCommand.Source $electronInstaller
+  if ($LASTEXITCODE -ne 0) {
+    throw "Electron runtime installation failed with exit code $LASTEXITCODE"
+  }
+  if (-not (Test-Path -LiteralPath $electronExecutable -PathType Leaf)) {
+    throw "Electron runtime executable not found after installation: $electronExecutable"
+  }
+}
+
 function Install-BuildDependencies {
   if ($SkipInstall) {
     Write-Host '[2/4] Skipping dependency installation by request.' -ForegroundColor DarkGray
@@ -146,6 +171,7 @@ function Install-BuildDependencies {
 
   Write-Host '[2/4] Installing locked dependencies...' -ForegroundColor Cyan
   Invoke-Npm -Arguments @('ci', '--no-audit', '--no-fund')
+  Install-ElectronRuntime
   Save-DependencyCache -Fingerprint $fingerprint
 }
 

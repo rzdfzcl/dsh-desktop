@@ -30,9 +30,16 @@ contextBridge.exposeInMainWorld('desktop', {
     choose: () => ipcRenderer.invoke('workspace:choose'),
     listFiles: () => ipcRenderer.invoke('workspace:list-files'),
     readFile: (relativePath) => ipcRenderer.invoke('workspace:read-file', relativePath),
+    onChanged: (callback) => subscribe('workspace:changed', callback),
   },
   review: {
-    get: () => ipcRenderer.invoke('review:get'),
+    get: (source = 'auto') => ipcRenderer.invoke('review:get', source),
+    getFileDiff: (source, relativePath) => ipcRenderer.invoke('review:get-file-diff', source, relativePath),
+  },
+  plugins: {
+    list: () => ipcRenderer.invoke('plugins:list'),
+    add: (packageSpec) => ipcRenderer.invoke('plugins:add', packageSpec),
+    remove: (packageName) => ipcRenderer.invoke('plugins:remove', packageName),
   },
   terminal: {
     run: (command) => ipcRenderer.invoke('terminal:run', command),

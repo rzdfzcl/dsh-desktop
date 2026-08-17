@@ -16,7 +16,9 @@ const workspacePath = document.querySelector('#workspace-path');
 const chooseWorkspaceButton = document.querySelector('#choose-workspace');
 const sidebarToast = document.querySelector('#sidebar-toast');
 const reviewSummary = document.querySelector('#review-summary');
-const reviewStatus = document.querySelector('#review-status');
+const reviewSourceSelect = document.querySelector('#review-source');
+const reviewTree = document.querySelector('#review-tree');
+const reviewDetailTitle = document.querySelector('#review-detail-title');
 const reviewDiff = document.querySelector('#review-diff');
 const refreshReviewButton = document.querySelector('#refresh-review');
 const terminalConsole = document.querySelector('#terminal-console');
@@ -31,6 +33,18 @@ const fileTree = document.querySelector('#file-tree');
 const filePreviewName = document.querySelector('#file-preview-name');
 const filePreview = document.querySelector('#file-preview');
 const refreshFilesButton = document.querySelector('#refresh-files');
+const refreshPluginsButton = document.querySelector('#refresh-plugins');
+const pluginProfilePath = document.querySelector('#plugin-profile-path');
+const pluginInstallForm = document.querySelector('#plugin-install-form');
+const pluginPackageInput = document.querySelector('#plugin-package-input');
+const pluginInstallButton = document.querySelector('#plugin-install-button');
+const pluginOperationStatus = document.querySelector('#plugin-operation-status');
+const pluginFilter = document.querySelector('#plugin-filter');
+const pluginFilterInput = document.querySelector('#plugin-filter-input');
+const pluginFilterCount = document.querySelector('#plugin-filter-count');
+const pluginList = document.querySelector('#plugin-list');
+const pluginRestartBar = document.querySelector('#plugin-restart-bar');
+const pluginRestartButton = document.querySelector('#plugin-restart-button');
 const environmentDialog = document.querySelector('#environment-dialog');
 const environmentDialogPanel = document.querySelector('#environment-dialog-panel');
 const environmentDialogIcon = document.querySelector('#environment-dialog-icon');
@@ -45,7 +59,7 @@ const topMenuButtons = [...document.querySelectorAll('[data-top-menu]')];
 const topMenuPopovers = [...document.querySelectorAll('[data-top-menu-popover]')];
 const topActionButtons = [...document.querySelectorAll('[data-top-action]')];
 
-const toolTitles = { review: '审阅', terminal: '终端', browser: '浏览器', files: '文件' };
+const toolTitles = { review: '审阅', terminal: '终端', browser: '浏览器', files: '文件', plugins: '插件管理' };
 const harnessStateLabels = {
   starting: '启动中',
   connecting: '连接中',
@@ -68,9 +82,20 @@ let terminalHistoryIndex = 0;
 const terminalHistory = [];
 const loadedTools = new Set();
 const collapsedDirectories = new Set();
+const collapsedReviewDirectories = new Set();
 let activeTopMenu = null;
 let lastContentFocus = null;
 let environmentDialogPreviousFocus = null;
+let environmentCheckSequence = 0;
+let reviewSourcePreference = 'auto';
+let activeReviewSource = null;
+let reviewLoadSequence = 0;
+let reviewDiffSequence = 0;
+let fileLoadSequence = 0;
+let pluginOperationBusy = false;
+let pluginListState = { profileRoot: '', plugins: [] };
+let pluginFilterQuery = '';
+const expandedPluginNames = new Set();
 
 window.desktop.dsh.onState(({ state, message, requirements = [] }) => {
   statusText.textContent = message;
@@ -92,6 +117,7 @@ window.desktop.dsh.onState(({ state, message, requirements = [] }) => {
 window.desktop.sidebar.onState(({ open, tool, workspace, panelWidth }) => {
   applySidebarState(open, tool, workspace, panelWidth);
 });
+window.desktop.workspace.onChanged((change) => applyWorkspaceChange(change));
 
 window.desktop.navigation.onMenuAction((action) => void runTopAction(action));
 window.desktop.navigation.onMenuClosed(() => resetTopMenuState());
@@ -166,12 +192,24 @@ async function runTopAction(action) {
   if (action === 'choose-workspace') return chooseWorkspace();
   if (action === 'open-logs') return openLogs();
   if (action === 'check-environment') {
-    const result = await window.desktop.dsh.checkEnvironment();
+    const requestId = ++environmentCheckSequence;
+    showEnvironmentDialogLoading();
+    let result;
+    try {
+      result = await window.desktop.dsh.checkEnvironment();
+    } catch (error) {
+      result = { ok: false, error: error.message || String(error) };
+    }
+    if (requestId !== environmentCheckSequence) return result;
     if (!Array.isArray(result?.items)) {
-      showSidebarToast(result?.error || '无法检查运行环境');
+      renderEnvironmentDialog({
+        ok: false,
+        error: result?.error || '无法检查运行环境',
+        items: [{ name: '环境检查', ok: false, detail: result?.error || '无法检查运行环境' }],
+      });
       return result;
     }
-    await showEnvironmentDialog(result);
+    renderEnvironmentDialog(result);
     return result;
   }
   if (action === 'copy-diagnostics') return copyDiagnostics();
@@ -193,21 +231,41 @@ async function runTopAction(action) {
   }
 }
 
-async function showEnvironmentDialog(report) {
-  environmentDialogPreviousFocus = document.activeElement;
+function showEnvironmentDialogLoading() {
+  if (environmentDialog.hidden) environmentDialogPreviousFocus = document.activeElement;
+  environmentDialog.dataset.status = 'loading';
+  environmentDialog.setAttribute('aria-busy', 'true');
+  environmentDialogIcon.textContent = '…';
+  environmentDialogSummary.textContent = '正在检查运行环境…';
+  const loading = document.createElement('div');
+  loading.className = 'environment-dialog-loading';
+  loading.textContent = '正在检测 Node.js、npm、dsh 与可选工具…';
+  environmentDialogList.replaceChildren(loading);
+  environmentDialogDone.disabled = true;
+  environmentDialog.hidden = false;
+  document.body.classList.add('has-modal-open');
+  environmentDialogPanel.focus();
+  void window.desktop.ui.setModalOpen(true);
+}
+
+function renderEnvironmentDialog(report) {
   environmentDialog.dataset.status = report.ok ? 'ready' : 'warning';
+  environmentDialog.setAttribute('aria-busy', 'false');
   environmentDialogIcon.textContent = report.ok ? '✓' : '!';
-  const failedCount = report.items.filter((item) => !item.ok).length;
-  environmentDialogSummary.textContent = report.ok
-    ? 'Node.js、npm、dsh 与 pnpm 均已就绪'
-    : `发现 ${failedCount} 项需要处理`;
+  const failedCount = report.items.filter((item) => !item.optional && !item.ok).length;
+  environmentDialogSummary.textContent = report.error
+    ? '检查失败，请稍后重试'
+    : report.ok
+      ? 'Node.js、npm 与 dsh 均已就绪'
+      : `发现 ${failedCount} 项必需环境需要处理`;
   const rows = report.items.map((item) => {
     const row = document.createElement('article');
     row.className = 'environment-item';
     row.dataset.ok = String(Boolean(item.ok));
+    row.dataset.optional = String(Boolean(item.optional));
     const state = document.createElement('span');
     state.className = 'environment-item-state';
-    state.textContent = item.ok ? '✓' : '!';
+    state.textContent = item.ok ? '✓' : item.optional ? '—' : '!';
     const content = document.createElement('div');
     content.className = 'environment-item-content';
     const heading = document.createElement('div');
@@ -215,7 +273,7 @@ async function showEnvironmentDialog(report) {
     const name = document.createElement('strong');
     name.textContent = item.name;
     const badge = document.createElement('span');
-    badge.textContent = item.ok ? '正常' : '需处理';
+    badge.textContent = item.optional ? (item.ok ? '可选 · 已安装' : '可选') : item.ok ? '正常' : '需处理';
     const detail = document.createElement('div');
     detail.className = 'environment-item-detail';
     detail.textContent = item.detail;
@@ -225,14 +283,12 @@ async function showEnvironmentDialog(report) {
     return row;
   });
   environmentDialogList.replaceChildren(...rows);
-  await window.desktop.ui.setModalOpen(true);
-  environmentDialog.hidden = false;
-  document.body.classList.add('has-modal-open');
-  environmentDialogPanel.focus();
+  environmentDialogDone.disabled = false;
 }
 
 function closeEnvironmentDialog() {
   if (environmentDialog.hidden) return;
+  environmentCheckSequence += 1;
   environmentDialog.hidden = true;
   document.body.classList.remove('has-modal-open');
   void window.desktop.ui.setModalOpen(false);
@@ -291,8 +347,11 @@ function applySidebarState(open, tool = activeTool, workspace = currentWorkspace
   sidebarToggle.setAttribute('aria-expanded', String(sidebarOpen));
   sidebarToggle.setAttribute('aria-label', sidebarOpen ? '收起侧边栏' : '展开侧边栏');
   sidebarToolTitle.textContent = toolTitles[activeTool];
-  workspacePath.textContent = currentWorkspace || '未选择工作区';
-  workspacePath.title = currentWorkspace;
+  workspacePath.textContent = activeTool === 'plugins'
+    ? 'DeepSeek Harness · web profile'
+    : currentWorkspace || '未选择工作区';
+  workspacePath.title = activeTool === 'plugins' ? '管理 web profile 的 npm 插件' : currentWorkspace;
+  chooseWorkspaceButton.hidden = activeTool === 'plugins';
   terminalPrompt.textContent = `PS ${currentWorkspace || ''}>`;
   for (const button of document.querySelectorAll('[data-sidebar-tool]')) {
     button.classList.toggle('is-active', button.dataset.sidebarTool === activeTool);
@@ -381,6 +440,7 @@ async function loadActiveTool(force = false) {
   if (!force && loadedTools.has(activeTool)) return;
   if (activeTool === 'review') await loadReview();
   if (activeTool === 'files') await loadFiles();
+  if (activeTool === 'plugins') await loadPlugins();
   loadedTools.add(activeTool);
 }
 
@@ -389,54 +449,196 @@ chooseWorkspaceButton.addEventListener('click', () => void chooseWorkspace());
 async function chooseWorkspace() {
   const result = await window.desktop.workspace.choose();
   if (!result?.ok) return;
-  currentWorkspace = result.path;
+  applyWorkspaceChange({ ...result, source: 'manual' });
+}
+
+function normalizeWorkspaceForComparison(value) {
+  return String(value || '').replaceAll('\\', '/').replace(/\/$/, '').toLowerCase();
+}
+
+function applyWorkspaceChange(change) {
+  if (!change?.path || normalizeWorkspaceForComparison(change.path) === normalizeWorkspaceForComparison(currentWorkspace)) return;
+  currentWorkspace = change.path;
   collapsedDirectories.clear();
+  collapsedReviewDirectories.clear();
+  reviewSourcePreference = 'auto';
+  reviewSourceSelect.value = 'auto';
+  reviewLoadSequence += 1;
+  reviewDiffSequence += 1;
+  fileLoadSequence += 1;
   loadedTools.delete('review');
   loadedTools.delete('files');
-  applySidebarState(true, activeTool, result.path, sidebarPanelWidth);
-  await loadActiveTool(true);
-  showSidebarToast(`已切换工作区：${result.name}`);
+  applySidebarState(sidebarOpen, activeTool, change.path, sidebarPanelWidth);
+  const prefix = change.source === 'harness' ? '已跟随 Harness 切换工作区' : '已切换工作区';
+  showSidebarToast(`${prefix}：${change.name || change.path.split(/[\\/]/).filter(Boolean).at(-1)}`);
 }
 
 refreshReviewButton.addEventListener('click', () => void loadReview());
+reviewSourceSelect.addEventListener('change', () => {
+  reviewSourcePreference = reviewSourceSelect.value;
+  collapsedReviewDirectories.clear();
+  void loadReview();
+});
 
 async function loadReview() {
-  reviewSummary.textContent = '正在刷新…';
-  reviewStatus.textContent = '正在读取 Git 状态…';
-  reviewDiff.textContent = '';
+  const requestId = ++reviewLoadSequence;
+  reviewDiffSequence += 1;
+  reviewSummary.textContent = '正在检查…';
+  reviewTree.innerHTML = `<div class="empty-state">${reviewSourcePreference === 'auto'
+    ? '正在自动识别 Git / SVN 工作区…'
+    : `正在读取 ${reviewSourcePreference === 'git' ? 'Git' : 'SVN'} 工作区…`}</div>`;
+  reviewDetailTitle.textContent = '选择文件以查看变更详情';
+  reviewDiff.textContent = '请从上方选择一个变更文件';
   reviewDiff.classList.add('empty-state');
-  const result = await window.desktop.review.get();
+  const result = await window.desktop.review.get(reviewSourcePreference);
+  if (requestId !== reviewLoadSequence) return;
   if (!result?.ok) {
     reviewSummary.textContent = '无法审阅';
-    reviewStatus.textContent = result?.error || '读取 Git 状态失败';
-    reviewDiff.textContent = '请选择一个 Git 工作区';
+    activeReviewSource = null;
+    renderReviewTreeMessage(result?.error || '无法识别 Git 或 SVN 工作区');
+    reviewDiff.textContent = '请选择 Git 或 SVN 工作区，或在上方手动切换版本控制类型';
     return;
   }
-  const changedFiles = result.status.split(/\r?\n/).filter((line) => line && !line.startsWith('##')).length;
-  const diffLines = result.diff.split(/\r?\n/);
-  const additions = diffLines.filter((line) => line.startsWith('+') && !line.startsWith('+++')).length;
-  const deletions = diffLines.filter((line) => line.startsWith('-') && !line.startsWith('---')).length;
-  renderReviewSummary(changedFiles, additions, deletions);
-  reviewStatus.textContent = result.status || '工作区无更改';
-  reviewDiff.classList.toggle('empty-state', !result.diff);
-  if (result.diff) renderReviewDiff(result.diff);
-  else reviewDiff.textContent = '暂无可审阅的更改';
+  activeReviewSource = result.source;
+  const autoOption = reviewSourceSelect.querySelector('option[value="auto"]');
+  autoOption.textContent = result.detectedSource
+    ? `自动（${result.detectedSource === 'git' ? 'Git' : 'SVN'}）`
+    : '自动';
+  const files = Array.isArray(result.files) ? result.files : [];
+  renderReviewSummary(result.source, files.length);
+  renderReviewTree(files);
+  if (!files.length) {
+    reviewDetailTitle.textContent = '工作区无更改';
+    reviewDiff.textContent = '暂无可审阅的更改';
+  }
 }
 
-function renderReviewSummary(changedFiles, additions, deletions) {
-  if (!changedFiles) {
-    reviewSummary.textContent = '工作区无更改';
+function renderReviewSummary(source, changedFiles) {
+  const sourceLabel = source === 'svn' ? 'SVN' : 'Git';
+  reviewSummary.textContent = changedFiles
+    ? `${sourceLabel} · ${changedFiles} 个变更`
+    : `${sourceLabel} · 工作区无更改`;
+}
+
+function renderReviewTreeMessage(message) {
+  const empty = document.createElement('div');
+  empty.className = 'empty-state';
+  empty.textContent = message;
+  reviewTree.replaceChildren(empty);
+}
+
+function renderReviewTree(files) {
+  if (!files.length) {
+    renderReviewTreeMessage('工作区无更改');
     return;
   }
-  const files = document.createElement('span');
-  files.textContent = `${changedFiles} 个文件`;
-  const added = document.createElement('span');
-  added.className = 'diff-count-add';
-  added.textContent = `+${additions}`;
-  const deleted = document.createElement('span');
-  deleted.className = 'diff-count-delete';
-  deleted.textContent = `-${deletions}`;
-  reviewSummary.replaceChildren(files, added, deleted);
+  const entries = createReviewTreeEntries(files);
+  const fragment = document.createDocumentFragment();
+  for (const entry of entries) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'review-tree-row';
+    row.style.paddingLeft = `${7 + entry.depth * 14}px`;
+    row.dataset.path = entry.path;
+    row.dataset.directory = String(entry.directory);
+    row.title = entry.directory ? entry.path : `${entry.path}（${entry.status}）`;
+    row.setAttribute('role', 'treeitem');
+    row.setAttribute('aria-level', String(entry.depth + 1));
+    const arrow = document.createElement('span');
+    arrow.className = 'review-tree-arrow';
+    arrow.textContent = entry.directory ? '⌄' : '';
+    const icon = document.createElement('span');
+    icon.className = `review-tree-icon ${entry.directory ? 'is-directory' : 'is-file'}`;
+    icon.textContent = entry.directory ? '▱' : '▧';
+    const name = document.createElement('span');
+    name.className = 'review-tree-name';
+    name.textContent = entry.name;
+    row.append(arrow, icon, name);
+    if (entry.directory) {
+      row.setAttribute('aria-expanded', String(!collapsedReviewDirectories.has(entry.path)));
+      row.addEventListener('click', () => toggleReviewDirectory(entry.path));
+    } else {
+      const status = document.createElement('span');
+      status.className = `review-tree-status is-${getReviewStatusKind(entry.status)}`;
+      status.textContent = entry.status;
+      row.append(status);
+      row.addEventListener('click', () => void loadReviewFileDiff(entry, row));
+    }
+    fragment.append(row);
+  }
+  reviewTree.replaceChildren(fragment);
+  updateReviewTreeVisibility();
+}
+
+function createReviewTreeEntries(files) {
+  const workspaceName = currentWorkspace.split(/[\\/]/).filter(Boolean).at(-1) || '工作区';
+  const directories = new Set();
+  for (const file of files) {
+    const parts = file.path.split('/');
+    for (let index = 1; index < parts.length; index += 1) {
+      directories.add(parts.slice(0, index).join('/'));
+    }
+  }
+  const entries = [{ path: '.', name: workspaceName, depth: 0, directory: true }];
+  for (const directoryPath of directories) {
+    const parts = directoryPath.split('/');
+    entries.push({ path: directoryPath, name: parts.at(-1), depth: parts.length, directory: true });
+  }
+  for (const file of files) {
+    const parts = file.path.split('/');
+    entries.push({ ...file, name: parts.at(-1), depth: parts.length, directory: false });
+  }
+  return entries.sort((left, right) => {
+    if (left.path === '.') return -1;
+    if (right.path === '.') return 1;
+    return left.path.localeCompare(right.path, 'zh-CN');
+  });
+}
+
+function toggleReviewDirectory(directoryPath) {
+  if (collapsedReviewDirectories.has(directoryPath)) collapsedReviewDirectories.delete(directoryPath);
+  else collapsedReviewDirectories.add(directoryPath);
+  updateReviewTreeVisibility();
+}
+
+function updateReviewTreeVisibility() {
+  const collapsed = [...collapsedReviewDirectories];
+  for (const row of reviewTree.querySelectorAll('.review-tree-row')) {
+    const rowPath = row.dataset.path;
+    row.hidden = collapsed.some((directoryPath) => (
+      directoryPath === '.' ? rowPath !== '.' : rowPath.startsWith(`${directoryPath}/`)
+    ));
+    if (row.dataset.directory === 'true') {
+      const expanded = !collapsedReviewDirectories.has(rowPath);
+      row.setAttribute('aria-expanded', String(expanded));
+      row.querySelector('.review-tree-arrow').textContent = expanded ? '⌄' : '›';
+    }
+  }
+}
+
+function getReviewStatusKind(status) {
+  if (status.includes('D') || status.includes('!')) return 'deleted';
+  if (status.includes('A') || status.includes('?')) return 'added';
+  if (status.includes('C') || status.includes('~')) return 'conflict';
+  return 'modified';
+}
+
+async function loadReviewFileDiff(file, row) {
+  const requestId = ++reviewDiffSequence;
+  for (const selected of reviewTree.querySelectorAll('.is-selected')) selected.classList.remove('is-selected');
+  row.classList.add('is-selected');
+  reviewDetailTitle.textContent = file.path;
+  reviewDiff.textContent = '正在读取变更详情…';
+  reviewDiff.classList.add('empty-state');
+  const result = await window.desktop.review.getFileDiff(activeReviewSource, file.path);
+  if (requestId !== reviewDiffSequence) return;
+  if (!result?.ok) {
+    reviewDiff.textContent = result?.error || '无法读取文件变更';
+    return;
+  }
+  reviewDiff.classList.toggle('empty-state', !result.diff);
+  if (result.diff) renderReviewDiff(result.diff);
+  else reviewDiff.textContent = '该文件没有可显示的文本差异';
 }
 
 function renderReviewDiff(diff) {
@@ -454,7 +656,7 @@ function renderReviewDiff(diff) {
       row.classList.add('diff-section-title');
       oldLine = null;
       newLine = null;
-    } else if (line.startsWith('diff --git ')) {
+    } else if (line.startsWith('diff --git ') || line.startsWith('Index: ')) {
       row.classList.add('diff-file-header');
       oldLine = null;
       newLine = null;
@@ -474,6 +676,7 @@ function renderReviewDiff(diff) {
       || line.startsWith('similarity index ')
       || line.startsWith('rename from ')
       || line.startsWith('rename to ')
+      || /^={3,}$/.test(line)
       || line.startsWith('\\ No newline')
     ) {
       row.classList.add('diff-meta');
@@ -635,8 +838,10 @@ window.desktop.browser.onState((state) => {
 refreshFilesButton.addEventListener('click', () => void loadFiles());
 
 async function loadFiles() {
+  const requestId = ++fileLoadSequence;
   fileTree.innerHTML = '<div class="empty-state">正在读取文件…</div>';
   const result = await window.desktop.workspace.listFiles();
+  if (requestId !== fileLoadSequence) return;
   if (!result?.ok) {
     fileTree.innerHTML = '';
     const error = document.createElement('div');
@@ -725,6 +930,215 @@ async function previewFile(relativePath, row) {
   const result = await window.desktop.workspace.readFile(relativePath);
   filePreview.textContent = result?.ok ? result.content : (result?.error || '无法读取文件');
   filePreview.classList.toggle('empty-state', !result?.ok);
+}
+
+refreshPluginsButton.addEventListener('click', () => void loadPlugins());
+pluginFilter.addEventListener('submit', (event) => {
+  event.preventDefault();
+  pluginFilterQuery = pluginFilterInput.value.trim().toLocaleLowerCase();
+  renderPluginList(pluginListState);
+});
+pluginInstallForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const packageSpec = pluginPackageInput.value.trim();
+  if (!packageSpec) {
+    pluginOperationStatus.dataset.state = 'error';
+    pluginOperationStatus.textContent = '请输入 npm 插件包名';
+    pluginPackageInput.focus();
+    return;
+  }
+  void performPluginAction('add', packageSpec);
+});
+pluginRestartButton.addEventListener('click', () => void restartHarnessForPlugins());
+
+async function loadPlugins() {
+  pluginOperationStatus.dataset.state = 'loading';
+  pluginOperationStatus.textContent = '正在读取 web profile 插件…';
+  pluginFilterInput.disabled = true;
+  pluginFilterCount.textContent = '';
+  pluginList.innerHTML = '<div class="empty-state">正在读取插件…</div>';
+  let result;
+  try {
+    result = await window.desktop.plugins.list();
+  } catch (error) {
+    result = { ok: false, error: error.message || String(error) };
+  }
+  if (result?.profileRoot) {
+    pluginProfilePath.textContent = result.profileRoot;
+    pluginProfilePath.title = result.profileRoot;
+  }
+  if (!result?.ok) {
+    pluginListState = { profileRoot: result?.profileRoot || '', plugins: [] };
+    pluginOperationStatus.dataset.state = 'error';
+    pluginOperationStatus.textContent = result?.error || '无法读取插件列表';
+    pluginFilter.hidden = true;
+    pluginList.innerHTML = '<div class="empty-state">插件列表不可用</div>';
+    return;
+  }
+  pluginFilterInput.disabled = false;
+  pluginOperationStatus.dataset.state = 'ready';
+  pluginOperationStatus.textContent = result.plugins.length
+    ? `已安装 ${result.plugins.length} 个插件`
+    : '尚未安装额外插件';
+  renderPluginList(result);
+}
+
+function renderPluginList(state) {
+  pluginListState = state;
+  const installedPluginNames = new Set(state.plugins.map((plugin) => plugin.name));
+  for (const pluginName of expandedPluginNames) {
+    if (!installedPluginNames.has(pluginName)) expandedPluginNames.delete(pluginName);
+  }
+  pluginProfilePath.textContent = state.profileRoot;
+  pluginProfilePath.title = state.profileRoot;
+  if (!state.plugins.length) {
+    pluginFilter.hidden = true;
+    pluginFilterInput.value = '';
+    pluginFilterQuery = '';
+    pluginFilterCount.textContent = '';
+    pluginList.innerHTML = '<div class="empty-state">输入 npm 包名即可安装插件</div>';
+    return;
+  }
+  pluginFilter.hidden = false;
+  const visiblePlugins = pluginFilterQuery
+    ? state.plugins.filter((plugin) => plugin.name.toLocaleLowerCase().includes(pluginFilterQuery))
+    : state.plugins;
+  pluginFilterCount.textContent = pluginFilterQuery
+    ? `${visiblePlugins.length} / ${state.plugins.length}`
+    : `${state.plugins.length} 个`;
+  if (!visiblePlugins.length) {
+    pluginList.innerHTML = '<div class="empty-state">没有匹配的插件</div>';
+    return;
+  }
+  const statusMeta = {
+    enabled: { label: '已启用', tone: 'success' },
+    installed: { label: '已安装', tone: 'success' },
+    update: { label: '有更新', tone: 'warning' },
+    error: { label: '异常', tone: 'error' },
+    disabled: { label: '已停用', tone: 'neutral' },
+  };
+  const cards = visiblePlugins.map((plugin) => {
+    const card = document.createElement('details');
+    card.className = 'plugin-card';
+    card.open = expandedPluginNames.has(plugin.name);
+    card.addEventListener('toggle', () => {
+      if (card.open) expandedPluginNames.add(plugin.name);
+      else expandedPluginNames.delete(plugin.name);
+    });
+    const pluginStatus = Object.hasOwn(statusMeta, plugin.status) ? plugin.status : 'installed';
+    const status = statusMeta[pluginStatus];
+    card.dataset.status = status.tone;
+    const summary = document.createElement('summary');
+    summary.className = 'plugin-card-summary';
+    const content = document.createElement('div');
+    content.className = 'plugin-card-content';
+    const name = document.createElement('strong');
+    name.textContent = plugin.name;
+    name.title = plugin.name;
+    content.append(name);
+    const statusIndicator = document.createElement('span');
+    statusIndicator.className = 'plugin-status-indicator';
+    statusIndicator.title = status.label;
+    const statusDot = document.createElement('span');
+    statusDot.className = 'plugin-status-dot';
+    statusDot.setAttribute('aria-hidden', 'true');
+    const statusLabel = document.createElement('span');
+    statusLabel.textContent = status.label;
+    statusIndicator.append(statusDot, statusLabel);
+    const chevron = document.createElement('span');
+    chevron.className = 'plugin-card-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    chevron.textContent = '›';
+    summary.append(content, statusIndicator, chevron);
+    const details = document.createElement('div');
+    details.className = 'plugin-card-details';
+    const metadata = document.createElement('div');
+    metadata.className = 'plugin-card-metadata';
+    const versionLabel = document.createElement('span');
+    versionLabel.textContent = '版本';
+    const versionValue = document.createElement('code');
+    versionValue.textContent = plugin.version;
+    const locationLabel = document.createElement('span');
+    locationLabel.textContent = '安装位置';
+    const locationValue = document.createElement('span');
+    locationValue.textContent = 'Web Profile';
+    metadata.append(versionLabel, versionValue, locationLabel, locationValue);
+    const actions = document.createElement('div');
+    actions.className = 'plugin-card-actions';
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'plugin-remove-button';
+    remove.textContent = '卸载';
+    remove.disabled = pluginOperationBusy;
+    remove.addEventListener('click', () => {
+      if (!window.confirm(`确定从 web profile 卸载 ${plugin.name}？`)) return;
+      void performPluginAction('remove', plugin.name);
+    });
+    actions.append(remove);
+    details.append(metadata, actions);
+    card.append(summary, details);
+    return card;
+  });
+  pluginList.replaceChildren(...cards);
+}
+
+async function performPluginAction(action, value) {
+  if (pluginOperationBusy) return;
+  setPluginOperationBusy(true);
+  const actionLabel = action === 'add' ? '安装' : '卸载';
+  pluginOperationStatus.dataset.state = 'loading';
+  pluginOperationStatus.textContent = `正在${actionLabel} ${value}，请稍候…`;
+  try {
+    const result = action === 'add'
+      ? await window.desktop.plugins.add(value)
+      : await window.desktop.plugins.remove(value);
+    if (!result?.ok) {
+      pluginOperationStatus.dataset.state = 'error';
+      pluginOperationStatus.textContent = result?.error || `插件${actionLabel}失败`;
+      return;
+    }
+    if (action === 'add') pluginPackageInput.value = '';
+    pluginOperationStatus.dataset.state = 'success';
+    pluginOperationStatus.textContent = `${result.changedPlugin} ${actionLabel}成功`;
+    renderPluginList(result);
+    pluginRestartBar.hidden = !result.restartRequired;
+    showSidebarToast(`插件${actionLabel}成功，重启 Harness 后生效`);
+  } catch (error) {
+    pluginOperationStatus.dataset.state = 'error';
+    pluginOperationStatus.textContent = `插件${actionLabel}失败：${error.message}`;
+  } finally {
+    setPluginOperationBusy(false);
+  }
+}
+
+function setPluginOperationBusy(busy) {
+  pluginOperationBusy = busy;
+  pluginPackageInput.disabled = busy;
+  pluginInstallButton.disabled = busy;
+  refreshPluginsButton.disabled = busy;
+  for (const button of pluginList.querySelectorAll('.plugin-remove-button')) button.disabled = busy;
+}
+
+async function restartHarnessForPlugins() {
+  pluginRestartButton.disabled = true;
+  pluginOperationStatus.dataset.state = 'loading';
+  pluginOperationStatus.textContent = '正在重启 Harness…';
+  try {
+    const result = await window.desktop.dsh.restart();
+    if (!result?.ok) {
+      pluginOperationStatus.dataset.state = 'error';
+      pluginOperationStatus.textContent = result?.error || 'Harness 重启失败';
+      return;
+    }
+    pluginRestartBar.hidden = true;
+    pluginOperationStatus.dataset.state = 'success';
+    pluginOperationStatus.textContent = 'Harness 已重启，插件变更已应用';
+  } catch (error) {
+    pluginOperationStatus.dataset.state = 'error';
+    pluginOperationStatus.textContent = `Harness 重启失败：${error.message}`;
+  } finally {
+    pluginRestartButton.disabled = false;
+  }
 }
 
 function showSidebarToast(message) {

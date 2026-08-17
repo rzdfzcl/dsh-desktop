@@ -1,5 +1,7 @@
 node_modules/
 release/
+release-verify/
+release-workspace-sync-verify/
 .tmp/
 *.log
 *.pfx

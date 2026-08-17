@@ -9,8 +9,6 @@
   "dshRuntime": {
     "packageName": "@deepseek-ai/dsh",
     "version": "0.1.0-rc.6",
-    "pnpmVersion": "11.1.2",
-    "minimumPnpmMajor": 10,
     "minimumNodeMajor": 20,
     "preferredNodeVersion": "24.19.0",
     "preferredNodeSha256": "57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73"
@@ -38,6 +36,7 @@
     "npmRebuild": false,
     "files": [
       "main.js",
+      "text-encoding.js",
       "preload.js",
       "harness-preload.js",
       "renderer/**/*",
@@ -84,5 +83,13 @@
       "artifactName": "${productName}-${version}-Portable.${ext}",
       "requestExecutionLevel": "user"
     }
+  },
+  "allowScripts": {
+    "electron-winstaller@5.4.0": true,
+    "koffi@3.1.5": true,
+    "node-pty@1.1.0": true,
+    "protobufjs@7.6.5": true,
+    "@deepseek-ai/dsh-subprocess-local@0.1.0-rc.6": true,
+    "@google/genai@1.52.0": true
   }
 }

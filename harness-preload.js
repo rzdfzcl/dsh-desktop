@@ -1,5 +1,34 @@
 'use strict';
 
+const { ipcRenderer } = require('electron');
+
+const SESSION_SELECTION_KEY = 'dsh.sessions.current';
+let lastWorkspaceSelection = '';
+
+function publishWorkspaceSelection() {
+  try {
+    const raw = window.localStorage.getItem(SESSION_SELECTION_KEY) || '';
+    const parsed = raw ? JSON.parse(raw) : {};
+    const selection = {
+      sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
+      parentSessionId: typeof parsed.subagentAddress?.parentSessionId === 'string'
+        ? parsed.subagentAddress.parentSessionId
+        : '',
+    };
+    const signature = JSON.stringify(selection);
+    if (signature === lastWorkspaceSelection) return;
+    lastWorkspaceSelection = signature;
+    ipcRenderer.send('harness:workspace-selection', selection);
+  } catch {
+    // The Harness runtime may be replacing its persisted selection during boot.
+  }
+}
+
+window.addEventListener('DOMContentLoaded', publishWorkspaceSelection, { once: true });
+window.addEventListener('pageshow', publishWorkspaceSelection);
+window.addEventListener('focus', publishWorkspaceSelection);
+window.setInterval(publishWorkspaceSelection, 500);
+
 // Compatibility for third-party bundles built against the legacy dsh client
 // stylesheet convention. The current HMR client removes style[data-plugin]
 // before refreshing a bundle, while some older bundles inject their CSS only
@@ -84,6 +113,8 @@ const observer = new MutationObserver((records) => {
       }
     }
   }
+
+  publishWorkspaceSelection();
 });
 
 observer.observe(document, { childList: true, subtree: true });

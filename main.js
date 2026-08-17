@@ -8,6 +8,7 @@ const { spawn } = require('node:child_process');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const packageMetadata = require('./package.json');
+const { decodeMixedTextBuffer, decodeTextBuffer, isLikelyBinary } = require('./text-encoding');
 const {
   app,
   BrowserWindow,
@@ -28,9 +29,6 @@ const DSH_PACKAGE_NAME = packageMetadata.dshRuntime?.packageName;
 const DSH_PACKAGE_SCOPE = String(DSH_PACKAGE_NAME || '').split('/')[0];
 const DSH_REQUIRED_VERSION = packageMetadata.dshRuntime?.version;
 const DSH_NPM_SPEC = `${DSH_PACKAGE_NAME}@${DSH_REQUIRED_VERSION}`;
-const PNPM_REQUIRED_VERSION = packageMetadata.dshRuntime?.pnpmVersion;
-const PNPM_NPM_SPEC = `pnpm@${PNPM_REQUIRED_VERSION}`;
-const MIN_PNPM_MAJOR = packageMetadata.dshRuntime?.minimumPnpmMajor;
 const MIN_NODE_MAJOR = packageMetadata.dshRuntime?.minimumNodeMajor;
 const PREFERRED_NODE_VERSION = packageMetadata.dshRuntime?.preferredNodeVersion;
 const PREFERRED_NODE_SHA256 = packageMetadata.dshRuntime?.preferredNodeSha256;
@@ -56,7 +54,9 @@ const SIDEBAR_MAX_WIDTH = 720;
 const SIDEBAR_MAIN_MIN_WIDTH = 480;
 const SIDEBAR_RESIZE_HANDLE_WIDTH = 5;
 const SIDEBAR_BROWSER_TOP = 146;
-const SIDEBAR_TOOLS = new Set(['review', 'terminal', 'browser', 'files']);
+const SIDEBAR_TOOLS = new Set(['review', 'terminal', 'browser', 'files', 'plugins']);
+const REVIEW_SOURCES = new Set(['auto', 'git', 'svn']);
+const PLUGIN_PROFILE_NAME = 'web';
 const WORKSPACE_FILE_LIMIT = 800;
 const WORKSPACE_TEXT_LIMIT = 1024 * 1024;
 const MANAGED_RUNTIME_FS_MAX_RETRIES = 8;
@@ -88,8 +88,10 @@ let sidebarOpen = false;
 let sidebarPanelWidth = SIDEBAR_DEFAULT_WIDTH;
 let sidebarActiveTool = 'review';
 let workspaceRoot = process.cwd();
+let harnessWorkspaceSyncGeneration = 0;
 let navigationPopupMenu = null;
 let modalOverlayOpen = false;
+let pluginOperationPromise = null;
 const managedInstallationProcesses = new Set();
 const managedInstallationDownloads = new Set();
 const intentionalHostStops = new Set();
@@ -336,6 +338,21 @@ function registerIpcHandlers() {
     return bootstrapHarness();
   });
 
+  ipcMain.handle('plugins:list', async (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return getPluginManagerState();
+  });
+
+  ipcMain.handle('plugins:add', async (event, packageSpec) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return runPluginOperation('add', packageSpec);
+  });
+
+  ipcMain.handle('plugins:remove', async (event, packageName) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return runPluginOperation('remove', packageName);
+  });
+
   ipcMain.handle('sidebar:get-state', (event) => {
     if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
     return {
@@ -387,9 +404,13 @@ function registerIpcHandlers() {
       properties: ['openDirectory'],
     });
     if (result.canceled || !result.filePaths[0]) return { ok: false, canceled: true };
-    workspaceRoot = path.resolve(result.filePaths[0]);
-    publishSidebarState();
+    updateWorkspaceRoot(result.filePaths[0], 'manual');
     return { ok: true, path: workspaceRoot, name: path.basename(workspaceRoot) };
+  });
+
+  ipcMain.on('harness:workspace-selection', (event, selection) => {
+    if (event.sender !== harnessView?.webContents) return;
+    void syncWorkspaceFromHarness(selection);
   });
 
   ipcMain.handle('workspace:list-files', async (event) => {
@@ -410,9 +431,20 @@ function registerIpcHandlers() {
     }
   });
 
-  ipcMain.handle('review:get', async (event) => {
+  ipcMain.handle('review:get', async (event, source = 'auto') => {
     if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
-    return getWorkspaceReview();
+    if (!REVIEW_SOURCES.has(source)) return { ok: false, error: '未知的版本控制类型' };
+    return getWorkspaceReview(source);
+  });
+
+  ipcMain.handle('review:get-file-diff', async (event, source, relativePath) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    if (source !== 'git' && source !== 'svn') return { ok: false, error: '请先选择 Git 或 SVN' };
+    try {
+      return await getWorkspaceFileDiff(source, relativePath);
+    } catch (error) {
+      return { ok: false, error: error.message || String(error) };
+    }
   });
 
   ipcMain.handle('terminal:run', async (event, command) => {
@@ -543,6 +575,7 @@ function createNavigationMenuTemplate(menuName) {
       action('终端', 'tool-terminal'),
       action('浏览器', 'tool-browser', 'CmdOrCtrl+T'),
       action('文件', 'tool-files', 'CmdOrCtrl+P'),
+      action('插件管理', 'tool-plugins'),
       { type: 'separator' },
       action('切换侧边栏', 'toggle-sidebar', 'CmdOrCtrl+Shift+S'),
     ];
@@ -597,31 +630,492 @@ async function readWorkspaceFile(relativePath) {
   if (!stat.isFile()) throw new Error('请选择一个文件');
   if (stat.size > WORKSPACE_TEXT_LIMIT) throw new Error('文件超过 1 MB，无法在侧边栏预览');
   const buffer = await fs.promises.readFile(absolutePath);
-  if (buffer.includes(0)) throw new Error('二进制文件无法预览');
+  const decoded = decodeTextBuffer(buffer);
+  if (isLikelyBinary(buffer, decoded)) throw new Error('二进制文件无法预览');
   return {
     path: path.relative(workspaceRoot, absolutePath).split(path.sep).join('/'),
-    content: buffer.toString('utf8'),
+    content: decoded.text,
+    encoding: decoded.encoding,
     size: stat.size,
   };
 }
 
-async function getWorkspaceReview() {
-  const status = await runWorkspaceProcess('git.exe', ['status', '--short', '--branch'], 20_000);
-  if (status.code !== 0) {
-    return { ok: false, error: status.stderr.trim() || '当前工作区不是 Git 仓库，或未安装 Git' };
+function updateWorkspaceRoot(candidate, source) {
+  const nextRoot = path.resolve(String(candidate || ''));
+  if (!isExistingDirectory(nextRoot)) return false;
+  if (path.normalize(nextRoot).toLowerCase() === path.normalize(workspaceRoot).toLowerCase()) return false;
+  workspaceRoot = nextRoot;
+  publishSidebarState();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('workspace:changed', {
+      path: workspaceRoot,
+      name: path.basename(workspaceRoot),
+      source,
+    });
   }
-  const [unstaged, staged] = await Promise.all([
-    runWorkspaceProcess('git.exe', ['-c', 'color.ui=false', 'diff', '--no-ext-diff', '--unified=3'], 30_000),
-    runWorkspaceProcess('git.exe', ['-c', 'color.ui=false', 'diff', '--cached', '--no-ext-diff', '--unified=3'], 30_000),
-  ]);
+  console.log(`[workspace] 已切换至 ${workspaceRoot}（source=${source}）`);
+  return true;
+}
+
+async function syncWorkspaceFromHarness(selection) {
+  const sessionId = typeof selection?.sessionId === 'string' ? selection.sessionId : '';
+  const parentSessionId = typeof selection?.parentSessionId === 'string' ? selection.parentSessionId : '';
+  if (!sessionId && !parentSessionId) return;
+  const generation = ++harnessWorkspaceSyncGeneration;
+  for (const waitMs of [0, 100, 350, 800]) {
+    if (waitMs) await delay(waitMs);
+    if (generation !== harnessWorkspaceSyncGeneration) return;
+    const selectedPath = await resolveHarnessWorkspacePath(sessionId, parentSessionId);
+    if (!selectedPath) continue;
+    updateWorkspaceRoot(selectedPath, 'harness');
+    return;
+  }
+  console.warn(`[workspace] 无法解析 Harness 当前会话所属工作区：${sessionId || parentSessionId}`);
+}
+
+async function resolveHarnessWorkspacePath(sessionId, parentSessionId) {
+  const storageRoot = path.join(app.getPath('home'), '.dsh', 'storages');
+  const candidateSessionIds = [parentSessionId, sessionId].filter(Boolean);
+  try {
+    const workspaceState = JSON.parse(await fs.promises.readFile(path.join(storageRoot, 'workspace.json'), 'utf8'));
+    const workspaces = Object.values(workspaceState?.tables?.workspaces || {});
+    const matched = workspaces.find((workspace) => (
+      Array.isArray(workspace?.sessionIds)
+      && candidateSessionIds.some((candidate) => workspace.sessionIds.includes(candidate))
+    ));
+    if (isExistingDirectory(matched?.path)) return path.resolve(matched.path);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.error('[workspace] 无法读取 Harness 工作区存储', error);
+  }
+
+  try {
+    const projectionState = JSON.parse(await fs.promises.readFile(path.join(storageRoot, 'session_projcache.json'), 'utf8'));
+    for (const candidate of candidateSessionIds) {
+      const cwd = projectionState?.tables?.sessions?.[candidate]?.identity?.cwd;
+      if (isExistingDirectory(cwd)) return path.resolve(cwd);
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.error('[workspace] 无法读取 Harness 会话投影', error);
+  }
+  return null;
+}
+
+function isExistingDirectory(candidate) {
+  if (typeof candidate !== 'string' || !candidate.trim()) return false;
+  try {
+    return fs.statSync(path.resolve(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function getPluginManagerState() {
+  const profileRoot = path.join(app.getPath('home'), '.dsh', 'profiles', PLUGIN_PROFILE_NAME);
+  const packageFile = path.join(profileRoot, 'package.json');
+  try {
+    if (!fs.existsSync(packageFile)) {
+      return {
+        ok: false,
+        profile: PLUGIN_PROFILE_NAME,
+        profileRoot,
+        error: `未找到 ${PLUGIN_PROFILE_NAME} profile：${profileRoot}`,
+      };
+    }
+    const metadata = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+    const dependencies = metadata.dependencies && typeof metadata.dependencies === 'object'
+      ? metadata.dependencies
+      : {};
+    const plugins = Object.entries(dependencies)
+      .map(([name, version]) => ({ name, version: String(version) }))
+      .sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'));
+    return { ok: true, profile: PLUGIN_PROFILE_NAME, profileRoot, plugins };
+  } catch (error) {
+    return {
+      ok: false,
+      profile: PLUGIN_PROFILE_NAME,
+      profileRoot,
+      error: `无法读取插件配置：${error.message || error}`,
+    };
+  }
+}
+
+async function runPluginOperation(action, input) {
+  if (pluginOperationPromise) return { ok: false, busy: true, error: '已有插件操作正在进行' };
+  let request;
+  try {
+    request = parsePluginPackageInput(input, action === 'add');
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  }
+  pluginOperationPromise = performPluginOperation(action, request).finally(() => {
+    pluginOperationPromise = null;
+  });
+  return pluginOperationPromise;
+}
+
+function parsePluginPackageInput(value, allowVersion) {
+  const input = String(value || '').trim();
+  if (!input || input.length > 214 || /[\s\0-\x1f]/.test(input)) {
+    throw new Error('请输入有效的 npm 插件包名');
+  }
+  const namePattern = '[a-z0-9][a-z0-9._-]*';
+  const versionPattern = '[a-z0-9._~^*+<>=|-]+';
+  const scoped = input.match(new RegExp(`^(@${namePattern}/${namePattern})(?:@(${versionPattern}))?$`, 'i'));
+  const unscoped = input.match(new RegExp(`^(${namePattern})(?:@(${versionPattern}))?$`, 'i'));
+  const match = scoped || unscoped;
+  if (!match || (!allowVersion && match[2])) {
+    throw new Error(allowVersion ? '仅支持 npm 注册表包名及可选版本' : '请输入已安装插件的完整包名');
+  }
+  return { spec: input, name: match[1] };
+}
+
+async function performPluginOperation(action, request) {
+  const current = await getPluginManagerState();
+  if (!current.ok) return current;
+  if (action === 'remove' && !current.plugins.some((plugin) => plugin.name === request.name)) {
+    return { ok: false, error: `插件未安装：${request.name}` };
+  }
+
+  let dsh;
+  try {
+    dsh = await findDshRuntimeForPluginManager();
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  }
+  const command = action === 'add' ? 'add' : 'remove';
+  const result = await withInstallationSession(() => runProcess(
+    dsh.node,
+    [dsh.cli, 'plugin', '--profile', PLUGIN_PROFILE_NAME, command, action === 'add' ? request.spec : request.name],
+    DSH_INSTALL_TIMEOUT_MS,
+    true,
+    true,
+    createRuntimeProcessEnvironment(dsh),
+  ));
+  if (result.cancelled) return { ok: false, error: '插件操作已取消' };
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      error: tail(result.stderr || result.stdout, 1_200) || `插件${action === 'add' ? '安装' : '卸载'}失败`,
+    };
+  }
+  const state = await getPluginManagerState();
+  return state.ok
+    ? { ...state, restartRequired: true, changedPlugin: request.name, action }
+    : state;
+}
+
+async function findDshRuntimeForPluginManager() {
+  const runtimes = await findNpmRuntimes();
+  for (const runtime of runtimes.filter((candidate) => candidate.major >= MIN_NODE_MAJOR)) {
+    const profilePackageRoot = path.join(
+      app.getPath('home'), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh',
+    );
+    const profileDsh = await validateDshInstallation(runtime.node, profilePackageRoot);
+    if (profileDsh) return profileDsh;
+    try {
+      const npmRoot = await getGlobalNpmRoot(runtime);
+      const globalDsh = await validateDshInstallation(
+        runtime.node,
+        path.join(npmRoot, '@deepseek-ai', 'dsh'),
+      );
+      if (globalDsh) return globalDsh;
+    } catch (error) {
+      console.error(`[plugins] 无法检查 npm 全局目录：${error.message || error}`);
+    }
+  }
+  throw new Error('未找到可用的 dsh CLI，请先完成运行环境安装');
+}
+
+async function getWorkspaceReview(requestedSource = 'auto') {
+  const detected = await detectWorkspaceVersionControl();
+  const source = requestedSource === 'auto' ? detected.source : requestedSource;
+  if (!source) {
+    const commandsMissing = detected.git.missing && detected.svn.missing;
+    return {
+      ok: false,
+      source: null,
+      detectedSource: null,
+      error: commandsMissing
+        ? '未检测到 Git 或 SVN 命令行工具，请安装相应工具后重试'
+        : '当前工作区不是 Git 仓库或 SVN 工作副本，可在上方手动选择版本控制类型',
+    };
+  }
+
+  const probe = detected[source];
+  if (!probe.root) {
+    const label = source === 'git' ? 'Git' : 'SVN';
+    const detectedLabel = detected.source === 'git' ? 'Git' : detected.source === 'svn' ? 'SVN' : null;
+    return {
+      ok: false,
+      source,
+      detectedSource: detected.source,
+      error: probe.missing
+        ? `未检测到 ${label} 命令行工具`
+        : `当前工作区不是 ${label}${source === 'git' ? ' 仓库' : ' 工作副本'}`
+          + (detectedLabel ? `；已自动识别为 ${detectedLabel}，可切换回“自动”` : ''),
+    };
+  }
+
+  const review = source === 'git'
+    ? await getGitWorkspaceReview(probe.targets)
+    : await getSvnWorkspaceReview(probe.targets);
+  return { ...review, source, detectedSource: detected.source, roots: probe.roots };
+}
+
+async function detectWorkspaceVersionControl() {
+  const [git, svn] = await Promise.all([inspectGitWorkspace(), inspectSvnWorkspace()]);
+  const matches = [
+    ...(git.root ? [{ source: 'git', root: git.root }] : []),
+    ...(svn.root ? [{ source: 'svn', root: svn.root }] : []),
+  ].sort((left, right) => getWorkspaceRootDepth(right.root) - getWorkspaceRootDepth(left.root));
+  return { source: matches[0]?.source || null, git, svn };
+}
+
+async function inspectGitWorkspace() {
+  const result = await runWorkspaceProcess('git.exe', ['rev-parse', '--show-toplevel'], 20_000);
+  const missing = result.code === -1 && /ENOENT|not found/i.test(result.stderr);
+  const directRoot = result.code === 0 ? normalizeDetectedWorkspaceRoot(result.stdout) : null;
+  const childRoots = !directRoot && !missing ? findImmediateChildVersionControlRoots('.git') : [];
+  const roots = directRoot ? [directRoot] : childRoots;
+  return {
+    root: roots[0] || null,
+    roots,
+    targets: directRoot ? [workspaceRoot] : childRoots,
+    missing,
+    error: result.stderr.trim(),
+  };
+}
+
+async function inspectSvnWorkspace() {
+  let result = await runWorkspaceProcess('svn.exe', ['info', '--show-item', 'wc-root'], 20_000);
+  let root = result.code === 0 ? normalizeDetectedWorkspaceRoot(result.stdout) : null;
+  if (!root && result.code !== -1) {
+    result = await runWorkspaceProcess('svn.exe', ['info', '--xml'], 20_000);
+    const match = result.code === 0 ? result.stdout.match(/<wcroot-abspath>([\s\S]*?)<\/wcroot-abspath>/i) : null;
+    root = match ? normalizeDetectedWorkspaceRoot(decodeXmlText(match[1])) : null;
+  }
+  const missing = result.code === -1 && /ENOENT|not found/i.test(result.stderr);
+  const childRoots = !root && !missing ? findImmediateChildVersionControlRoots('.svn') : [];
+  const roots = root ? [root] : childRoots;
+  return {
+    root: roots[0] || null,
+    roots,
+    targets: root ? [workspaceRoot] : childRoots,
+    missing,
+    error: result.stderr.trim(),
+  };
+}
+
+function findImmediateChildVersionControlRoots(marker) {
+  try {
+    return fs.readdirSync(workspaceRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(workspaceRoot, entry.name, marker)))
+      .map((entry) => path.join(workspaceRoot, entry.name));
+  } catch (error) {
+    console.error(`[review] 无法扫描工作区中的 ${marker} 项目`, error);
+    return [];
+  }
+}
+
+function normalizeDetectedWorkspaceRoot(value) {
+  const root = String(value || '').trim();
+  return root ? path.resolve(root) : null;
+}
+
+function getWorkspaceRootDepth(root) {
+  return path.resolve(root).split(path.sep).filter(Boolean).length;
+}
+
+function decodeXmlText(value) {
+  return String(value || '').replace(/&(?:#(\d+)|#x([0-9a-f]+)|amp|lt|gt|quot|apos);/gi, (entity, decimal, hexadecimal) => {
+    if (decimal) return String.fromCodePoint(Number(decimal));
+    if (hexadecimal) return String.fromCodePoint(Number.parseInt(hexadecimal, 16));
+    return { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'" }[entity.toLowerCase()] || entity;
+  });
+}
+
+async function getGitWorkspaceReview(targets) {
+  const files = [];
+  const statuses = [];
+  for (const target of targets) {
+    const [status, porcelain] = await Promise.all([
+      runWorkspaceProcess('git.exe', ['status', '--short', '--branch', '--', '.'], 20_000, { cwd: target }),
+      runWorkspaceProcess('git.exe', ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.'], 20_000, { cwd: target }),
+    ]);
+    if (status.code !== 0 || porcelain.code !== 0) {
+      return { ok: false, error: (status.stderr || porcelain.stderr).trim() || '无法读取 Git 工作区状态' };
+    }
+    if (status.stdout.trim()) statuses.push(status.stdout.trim());
+    files.push(...parseGitStatusFiles(porcelain.stdout, target));
+  }
   return {
     ok: true,
-    status: status.stdout.trim(),
-    diff: [
-      staged.stdout.trim() ? `# 已暂存\n${staged.stdout.trim()}` : '',
-      unstaged.stdout.trim() ? `# 未暂存\n${unstaged.stdout.trim()}` : '',
-    ].filter(Boolean).join('\n\n'),
+    status: statuses.join('\n'),
+    files: files.sort((left, right) => left.path.localeCompare(right.path, 'zh-CN')),
   };
+}
+
+async function getSvnWorkspaceReview(targets) {
+  const batches = createCommandArgumentBatches(targets, 12_000);
+  const results = [];
+  for (const batch of batches) {
+    results.push(await runWorkspaceProcess('svn.exe', ['status', '--xml', '--', ...batch], 60_000));
+  }
+  const failed = results.find((result) => result.code !== 0);
+  if (failed) {
+    return {
+      ok: false,
+      error: failed.stderr.trim() || '无法读取 SVN 工作副本状态',
+    };
+  }
+  return {
+    ok: true,
+    status: '',
+    files: results
+      .flatMap((result) => parseSvnStatusFiles(result.stdout))
+      .sort((left, right) => left.path.localeCompare(right.path, 'zh-CN')),
+  };
+}
+
+function createCommandArgumentBatches(values, maximumCharacters) {
+  const batches = [];
+  let batch = [];
+  let length = 0;
+  for (const value of values) {
+    const additionalLength = String(value).length + 3;
+    if (batch.length && length + additionalLength > maximumCharacters) {
+      batches.push(batch);
+      batch = [];
+      length = 0;
+    }
+    batch.push(value);
+    length += additionalLength;
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
+function parseGitStatusFiles(output, targetRoot) {
+  const entries = String(output || '').split('\0');
+  const files = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (!entry || entry.length < 4) continue;
+    const status = entry.slice(0, 2);
+    const relativePath = normalizeReviewPath(path.resolve(targetRoot, entry.slice(3)));
+    if (relativePath) files.push({ path: relativePath, status: status.trim() || 'M' });
+    if (/[RC]/.test(status)) index += 1;
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path, 'zh-CN'));
+}
+
+function parseSvnStatusFiles(output) {
+  const files = [];
+  const entryPattern = /<entry\s+path="([^"]*)"[^>]*>([\s\S]*?)<\/entry>/gi;
+  for (const match of String(output || '').matchAll(entryPattern)) {
+    const statusTag = match[2].match(/<wc-status\b([^>]*)/i)?.[1] || '';
+    const item = statusTag.match(/\bitem="([^"]+)"/i)?.[1] || 'normal';
+    const properties = statusTag.match(/\bprops="([^"]+)"/i)?.[1] || 'none';
+    if (item === 'normal' && properties === 'none') continue;
+    const relativePath = normalizeReviewPath(decodeXmlText(match[1]));
+    if (!relativePath) continue;
+    const absolutePath = resolveWorkspacePath(relativePath);
+    if (fs.existsSync(absolutePath) && fs.statSync(absolutePath).isDirectory()) continue;
+    files.push({ path: relativePath, status: getSvnStatusCode(item, properties) });
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path, 'zh-CN'));
+}
+
+function getSvnStatusCode(item, properties) {
+  if (item === 'normal' && properties !== 'none') return 'M';
+  return {
+    added: 'A',
+    conflicted: 'C',
+    deleted: 'D',
+    external: 'X',
+    ignored: 'I',
+    incomplete: '!',
+    merged: 'G',
+    missing: '!',
+    modified: 'M',
+    obstructed: '~',
+    replaced: 'R',
+    unversioned: '?',
+  }[item] || item.slice(0, 1).toUpperCase();
+}
+
+function normalizeReviewPath(value) {
+  const absolutePath = path.resolve(workspaceRoot, String(value || ''));
+  const relativePath = path.relative(path.resolve(workspaceRoot), absolutePath);
+  if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) return null;
+  return relativePath.split(path.sep).join('/');
+}
+
+async function getWorkspaceFileDiff(source, relativePath) {
+  const absolutePath = resolveWorkspacePath(relativePath);
+  const normalizedPath = path.relative(workspaceRoot, absolutePath).split(path.sep).join('/');
+  if (!normalizedPath) throw new Error('请选择一个变更文件');
+  const repositoryRoot = findContainingVersionControlRoot(absolutePath, source === 'git' ? '.git' : '.svn');
+  if (!repositoryRoot) throw new Error(`无法定位该文件所属的 ${source === 'git' ? 'Git' : 'SVN'} 工作区`);
+  const repositoryPath = path.relative(repositoryRoot, absolutePath).split(path.sep).join('/');
+  const diff = source === 'git'
+    ? await getGitFileDiff(repositoryRoot, repositoryPath, normalizedPath)
+    : await getSvnFileDiff(repositoryRoot, repositoryPath, normalizedPath);
+  return { ok: true, source, path: normalizedPath, diff };
+}
+
+function findContainingVersionControlRoot(absolutePath, marker) {
+  let directory = fs.existsSync(absolutePath) && fs.statSync(absolutePath).isDirectory()
+    ? absolutePath
+    : path.dirname(absolutePath);
+  while (true) {
+    if (fs.existsSync(path.join(directory, marker))) return directory;
+    const parent = path.dirname(directory);
+    if (parent === directory) return null;
+    directory = parent;
+  }
+}
+
+async function getGitFileDiff(repositoryRoot, repositoryPath, workspacePath) {
+  const [unstaged, staged] = await Promise.all([
+    runWorkspaceProcess('git.exe', ['-c', 'color.ui=false', 'diff', '--no-ext-diff', '--unified=3', '--', repositoryPath], 30_000, { cwd: repositoryRoot, encoding: 'auto' }),
+    runWorkspaceProcess('git.exe', ['-c', 'color.ui=false', 'diff', '--cached', '--no-ext-diff', '--unified=3', '--', repositoryPath], 30_000, { cwd: repositoryRoot, encoding: 'auto' }),
+  ]);
+  if (unstaged.code !== 0 || staged.code !== 0) {
+    throw new Error((unstaged.stderr || staged.stderr).trim() || '无法读取 Git 文件差异');
+  }
+  const diff = [
+    staged.stdout.trim() ? `# 已暂存\n${staged.stdout.trim()}` : '',
+    unstaged.stdout.trim() ? `# 未暂存\n${unstaged.stdout.trim()}` : '',
+  ].filter(Boolean).join('\n\n');
+  return diff || await createUnversionedFileDiff('git', repositoryRoot, repositoryPath, workspacePath);
+}
+
+async function getSvnFileDiff(repositoryRoot, repositoryPath, workspacePath) {
+  const result = await runWorkspaceProcess('svn.exe', ['diff', '--', repositoryPath], 30_000, { cwd: repositoryRoot, encoding: 'auto' });
+  if (result.code !== 0) throw new Error(result.stderr.trim() || '无法读取 SVN 文件差异');
+  return result.stdout.trim() || await createUnversionedFileDiff('svn', repositoryRoot, repositoryPath, workspacePath);
+}
+
+async function createUnversionedFileDiff(source, repositoryRoot, repositoryPath, workspacePath) {
+  const statusArguments = source === 'git'
+    ? ['status', '--porcelain=v1', '--untracked-files=all', '--', repositoryPath]
+    : ['status', '--', repositoryPath];
+  const executable = source === 'git' ? 'git.exe' : 'svn.exe';
+  const status = await runWorkspaceProcess(executable, statusArguments, 20_000, { cwd: repositoryRoot });
+  const unversioned = source === 'git'
+    ? status.stdout.startsWith('??')
+    : status.stdout.trimStart().startsWith('?');
+  if (!unversioned || !fs.existsSync(resolveWorkspacePath(workspacePath))) return '';
+  const file = await readWorkspaceFile(workspacePath);
+  const lines = file.content.split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop();
+  return [
+    `--- /dev/null`,
+    `+++ ${workspacePath}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines.map((line) => `+${line}`),
+  ].join('\n');
 }
 
 async function runTerminalCommand(command, onOutput = null) {
@@ -679,10 +1173,13 @@ function runWorkspaceProcess(executable, args, timeoutMs, options = {}) {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
+    const autoEncoding = options.encoding === 'auto';
+    const stdoutChunks = [];
+    const stderrChunks = [];
     let settled = false;
     let timer = null;
-    const stdoutDecoder = createTerminalDecoder(options.encoding);
-    const stderrDecoder = createTerminalDecoder(options.encoding);
+    const stdoutDecoder = autoEncoding ? null : createTerminalDecoder(options.encoding);
+    const stderrDecoder = autoEncoding ? null : createTerminalDecoder(options.encoding);
     const managedNodeDirectory = getManagedNodeDirectory();
     const env = {
       ...process.env,
@@ -691,7 +1188,7 @@ function runWorkspaceProcess(executable, args, timeoutMs, options = {}) {
         : process.env.PATH,
     };
     const child = spawn(executable, args, {
-      cwd: workspaceRoot,
+      cwd: options.cwd || workspaceRoot,
       env,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -706,12 +1203,23 @@ function runWorkspaceProcess(executable, args, timeoutMs, options = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      emitOutput('stdout', stdoutDecoder.decode());
-      emitOutput('stderr', stderrDecoder.decode());
+      if (autoEncoding) {
+        emitOutput('stdout', decodeMixedTextBuffer(Buffer.concat(stdoutChunks)).text);
+        emitOutput('stderr', decodeMixedTextBuffer(Buffer.concat(stderrChunks)).text);
+      } else {
+        emitOutput('stdout', stdoutDecoder.decode());
+        emitOutput('stderr', stderrDecoder.decode());
+      }
       resolve({ code, stdout: stdout.slice(-WORKSPACE_TEXT_LIMIT), stderr: stderr.slice(-WORKSPACE_TEXT_LIMIT) });
     };
-    child.stdout.on('data', (chunk) => emitOutput('stdout', stdoutDecoder.decode(chunk, { stream: true })));
-    child.stderr.on('data', (chunk) => emitOutput('stderr', stderrDecoder.decode(chunk, { stream: true })));
+    child.stdout.on('data', (chunk) => {
+      if (autoEncoding) stdoutChunks.push(Buffer.from(chunk));
+      else emitOutput('stdout', stdoutDecoder.decode(chunk, { stream: true }));
+    });
+    child.stderr.on('data', (chunk) => {
+      if (autoEncoding) stderrChunks.push(Buffer.from(chunk));
+      else emitOutput('stderr', stderrDecoder.decode(chunk, { stream: true }));
+    });
     child.once('error', (error) => { stderr += error.message; finish(-1); });
     child.once('close', (code) => finish(code ?? -1));
     timer = setTimeout(() => {
@@ -852,7 +1360,7 @@ async function inspectRuntimeEnvironment() {
       items.push({ name: 'npm', ok: false, detail: '未检测' });
     }
     items.push({ name: 'dsh', ok: false, detail: `未检测（需要 ${DSH_REQUIRED_VERSION}）` });
-    items.push({ name: 'pnpm', ok: false, detail: `未检测（最低 v${MIN_PNPM_MAJOR}）` });
+    items.push({ name: 'pnpm', ok: false, optional: true, detail: '未检测（可选，不影响 Harness 运行）' });
     return { ok: false, items };
   }
 
@@ -881,9 +1389,10 @@ async function inspectRuntimeEnvironment() {
   items.push({
     name: 'pnpm',
     ok: Boolean(pnpm),
-    detail: pnpm ? `${pnpm.version}（${pnpm.command}）` : `未检测到兼容版本（最低 v${MIN_PNPM_MAJOR}）`,
+    optional: true,
+    detail: pnpm ? `${pnpm.version}（${pnpm.command}）` : '未安装（可选，不影响 Harness 运行）',
   });
-  return { ok: items.every((item) => item.ok), items };
+  return { ok: items.filter((item) => !item.optional).every((item) => item.ok), items };
 }
 
 function createAppIcon() {
@@ -1397,12 +1906,6 @@ async function ensureGlobalDsh(options = {}) {
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(DSH_REQUIRED_VERSION || '')) {
     throw new Error(`package.json 中的 ${DSH_PACKAGE_NAME} 版本无效`);
   }
-  if (!/^\d+\.\d+\.\d+$/.test(PNPM_REQUIRED_VERSION || '')) {
-    throw new Error('package.json 中的 dshRuntime.pnpmVersion 无效');
-  }
-  if (!Number.isInteger(MIN_PNPM_MAJOR) || MIN_PNPM_MAJOR < 8) {
-    throw new Error('package.json 中的 dshRuntime.minimumPnpmMajor 无效');
-  }
   if (!Number.isInteger(MIN_NODE_MAJOR) || MIN_NODE_MAJOR < 20) {
     throw new Error('package.json 中的 dshRuntime.minimumNodeMajor 无效');
   }
@@ -1504,7 +2007,6 @@ async function ensureGlobalDsh(options = {}) {
   for (const packageRoot of packageRoots) {
     const validated = await validateDshInstallation(npmRuntime.node, packageRoot);
     if (validated) {
-      await repairPnpmIfNeeded(npmRuntime);
       return validated;
     }
   }
@@ -1530,28 +2032,7 @@ async function ensureGlobalDsh(options = {}) {
   if (!validated) {
     throw new Error(`dsh 安装完成，但版本或 CLI 健康检查未通过：${packageRoot}`);
   }
-  await repairPnpmIfNeeded(npmRuntime);
   return validated;
-}
-
-async function repairPnpmIfNeeded(runtime) {
-  try {
-    return await ensurePnpmAvailable(runtime);
-  } catch (error) {
-    console.error(`[install] pnpm 自动修复失败，不阻止 Harness 启动：${error.message || error}`);
-    return null;
-  }
-}
-
-async function ensurePnpmAvailable(runtime) {
-  const installed = await validatePnpmInstallation(runtime);
-  if (installed) return installed;
-  await withInstallationSession(() => installPnpmWithRegistryFallback(runtime));
-  const repaired = await validatePnpmInstallation(runtime);
-  if (!repaired) {
-    throw new Error(`pnpm ${PNPM_REQUIRED_VERSION} 安装完成，但健康检查未通过`);
-  }
-  return repaired;
 }
 
 async function validatePnpmInstallation(runtime) {
@@ -1563,7 +2044,7 @@ async function validatePnpmInstallation(runtime) {
     if (!fs.existsSync(packageFile) || !fs.existsSync(command)) return null;
     const metadata = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
     const pnpmVersion = parseNodeVersion(metadata.version);
-    if (metadata.name !== 'pnpm' || !pnpmVersion || pnpmVersion.major < MIN_PNPM_MAJOR) return null;
+    if (metadata.name !== 'pnpm' || !pnpmVersion) return null;
     const configuredBin = typeof metadata.bin === 'string' ? metadata.bin : metadata.bin?.pnpm;
     const cli = path.resolve(packageRoot, configuredBin || path.join('bin', 'pnpm.cjs'));
     if (!fs.existsSync(cli)) return null;
@@ -1577,69 +2058,13 @@ async function validatePnpmInstallation(runtime) {
     );
     const version = versionCheck.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
     const reportedVersion = parseNodeVersion(version);
-    if (versionCheck.code !== 0 || !reportedVersion || reportedVersion.major < MIN_PNPM_MAJOR) return null;
-    console.log(`[install] pnpm 健康检查通过：${version} (${command})`);
+    if (versionCheck.code !== 0 || !reportedVersion) return null;
+    console.log(`[environment] pnpm 检查通过：${version} (${command})`);
     return { version, command, cli };
   } catch (error) {
-    console.error('[install] 无法校验 pnpm', error);
+    console.error('[environment] 无法校验 pnpm', error);
     return null;
   }
-}
-
-async function installPnpmWithRegistryFallback(runtime) {
-  const registries = await getNpmRegistryCandidates(runtime);
-  const failures = [];
-  for (let registryIndex = 0; registryIndex < registries.length; registryIndex += 1) {
-    const registry = registries[registryIndex];
-    const registryLabel = formatRegistryLabel(registry);
-    for (let attempt = 1; attempt <= DSH_INSTALL_ATTEMPTS_PER_REGISTRY; attempt += 1) {
-      const attemptText = DSH_INSTALL_ATTEMPTS_PER_REGISTRY > 1
-        ? `，第 ${attempt}/${DSH_INSTALL_ATTEMPTS_PER_REGISTRY} 次`
-        : '';
-      publishServiceState(
-        'installing',
-        `正在安装 ${PNPM_NPM_SPEC}（${registryLabel}${attemptText}）…`,
-      );
-      const installArguments = [
-        runtime.cli,
-        'install', '-g', PNPM_NPM_SPEC,
-        `--registry=${registry}`,
-        '--no-audit', '--no-fund', '--loglevel=error',
-        '--fetch-retries=1',
-        '--fetch-retry-mintimeout=1000',
-        '--fetch-retry-maxtimeout=10000',
-        '--fetch-timeout=60000',
-      ];
-      if (runtime.managed) installArguments.push(`--prefix=${runtime.root}`);
-      const result = await runProcess(
-        runtime.node,
-        installArguments,
-        DSH_INSTALL_TIMEOUT_MS,
-        true,
-        true,
-        createRuntimeProcessEnvironment(runtime),
-      );
-      if (result.cancelled) throw new Error('pnpm 安装已取消');
-      if (result.code === 0) {
-        console.log(`[install] ${PNPM_NPM_SPEC} 安装成功，来源：${registryLabel}`);
-        return registry;
-      }
-      const detail = tail(result.stderr || result.stdout, 400);
-      failures.push(`${registryLabel}（第 ${attempt} 次）：${detail}`);
-      console.error(
-        `[install] ${PNPM_NPM_SPEC} 安装失败，来源：${registryLabel}，`
-        + `attempt=${attempt}，code=${result.code}：${detail}`,
-      );
-      if (attempt < DSH_INSTALL_ATTEMPTS_PER_REGISTRY) {
-        publishServiceState('installing', `${registryLabel} 安装 pnpm 失败，正在重试…`);
-        await delay(1_000 * attempt);
-      }
-    }
-    if (registryIndex < registries.length - 1) {
-      publishServiceState('installing', `${registryLabel} 不可用，正在切换 pnpm 安装源…`);
-    }
-  }
-  throw new Error(`pnpm 自动安装失败，所有安装源均不可用：${tail(failures.join('\n'), 1_200)}`);
 }
 
 async function installDshWithRegistryFallback(runtime) {

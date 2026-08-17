@@ -102,6 +102,9 @@
           <button class="rail-button" type="button" data-sidebar-tool="files" title="文件（Ctrl+P）">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h6l1.7 2H20.5v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"></path><path d="M6 7.5V5.8A1.8 1.8 0 0 1 7.8 4h4.7"></path></svg><span class="sr-only">文件</span>
           </button>
+          <button class="rail-button" type="button" data-sidebar-tool="plugins" title="插件管理">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 4.5h7v4h4v7h-4v4h-7v-4h-4v-7h4z"></path><circle cx="12" cy="12" r="2.2"></circle></svg><span class="sr-only">插件管理</span>
+          </button>
         </nav>
       </div>
 
@@ -114,9 +117,18 @@
         </header>
 
         <section class="tool-panel is-active" data-tool-panel="review" aria-label="审阅">
-          <div class="panel-toolbar"><span id="review-summary">工作区更改</span><button id="refresh-review" class="text-button" type="button">刷新</button></div>
-          <pre id="review-status" class="review-status">正在读取 Git 状态…</pre>
-          <div id="review-diff" class="diff-view empty-state">暂无可审阅的更改</div>
+          <div class="panel-toolbar review-toolbar">
+            <span id="review-summary">工作区更改</span>
+            <select id="review-source" class="review-source-select" aria-label="版本控制类型" title="选择版本控制类型">
+              <option value="auto">自动</option>
+              <option value="git">Git</option>
+              <option value="svn">SVN</option>
+            </select>
+            <button id="refresh-review" class="text-button" type="button">刷新</button>
+          </div>
+          <div id="review-tree" class="review-tree" role="tree" aria-label="变更文件"><div class="empty-state">正在检查工作区…</div></div>
+          <div class="review-detail-header"><span id="review-detail-title">选择文件以查看变更详情</span></div>
+          <div id="review-diff" class="diff-view empty-state">请从上方选择一个变更文件</div>
         </section>
 
         <section class="tool-panel" data-tool-panel="terminal" aria-label="终端">
@@ -153,6 +165,28 @@
           <div id="file-tree" class="file-tree"><div class="empty-state">正在读取文件…</div></div>
           <div class="file-preview-header"><span id="file-preview-name">选择文件以预览</span></div>
           <pre id="file-preview" class="file-preview empty-state">文件内容会显示在这里</pre>
+        </section>
+
+        <section class="tool-panel plugins-panel" data-tool-panel="plugins" aria-label="插件管理">
+          <div class="panel-toolbar"><span>Web Profile 插件</span><button id="refresh-plugins" class="text-button" type="button">刷新</button></div>
+          <div class="plugin-intro">
+            <strong>安装 npm 插件</strong>
+            <span id="plugin-profile-path">正在读取 web profile…</span>
+          </div>
+          <form id="plugin-install-form" class="plugin-install-form">
+            <input id="plugin-package-input" type="text" autocomplete="off" spellcheck="false" placeholder="例如 @scope/dsh-plugin" aria-label="npm 插件包名" />
+            <button id="plugin-install-button" type="submit">安装</button>
+          </form>
+          <div id="plugin-operation-status" class="plugin-operation-status" role="status" aria-live="polite"></div>
+          <form id="plugin-filter" class="plugin-filter" hidden>
+            <input id="plugin-filter-input" type="search" autocomplete="off" spellcheck="false" placeholder="按名称筛选" aria-label="按插件名称筛选" />
+            <span id="plugin-filter-count" class="plugin-filter-count" aria-live="polite"></span>
+          </form>
+          <div id="plugin-list" class="plugin-list"><div class="empty-state">正在读取插件…</div></div>
+          <div id="plugin-restart-bar" class="plugin-restart-bar" hidden>
+            <span>插件变更将在重启后生效</span>
+            <button id="plugin-restart-button" type="button">重启 Harness</button>
+          </div>
         </section>
       </div>
     </aside>
