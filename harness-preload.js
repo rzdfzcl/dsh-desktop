@@ -4,6 +4,30 @@ const { ipcRenderer } = require('electron');
 
 const SESSION_SELECTION_KEY = 'dsh.sessions.current';
 let lastWorkspaceSelection = '';
+let lastHarnessTheme = '';
+
+function getHarnessTheme() {
+  const root = document.documentElement;
+  const body = document.body;
+  if (body?.hasAttribute('data-ds-dark-theme')) return 'dark';
+
+  const colorScheme = String(root?.style.colorScheme || '').toLowerCase();
+  if (colorScheme.includes('dark')) return 'dark';
+  if (colorScheme.includes('light')) return 'light';
+
+  try {
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  } catch {
+    return 'light';
+  }
+}
+
+function publishHarnessTheme() {
+  const theme = getHarnessTheme();
+  if (theme === lastHarnessTheme) return;
+  lastHarnessTheme = theme;
+  ipcRenderer.send('harness:theme', theme);
+}
 
 function publishWorkspaceSelection() {
   try {
@@ -24,10 +48,26 @@ function publishWorkspaceSelection() {
   }
 }
 
-window.addEventListener('DOMContentLoaded', publishWorkspaceSelection, { once: true });
-window.addEventListener('pageshow', publishWorkspaceSelection);
-window.addEventListener('focus', publishWorkspaceSelection);
+window.addEventListener('DOMContentLoaded', () => {
+  publishWorkspaceSelection();
+  publishHarnessTheme();
+}, { once: true });
+window.addEventListener('pageshow', () => {
+  publishWorkspaceSelection();
+  publishHarnessTheme();
+});
+window.addEventListener('focus', () => {
+  publishWorkspaceSelection();
+  publishHarnessTheme();
+});
 window.setInterval(publishWorkspaceSelection, 500);
+
+try {
+  const colorSchemeMedia = window.matchMedia?.('(prefers-color-scheme: dark)');
+  colorSchemeMedia?.addEventListener('change', publishHarnessTheme);
+} catch {
+  // Some embedded Chromium versions do not expose matchMedia listeners.
+}
 
 // Compatibility for third-party bundles built against the legacy dsh client
 // stylesheet convention. The current HMR client removes style[data-plugin]
@@ -115,6 +155,12 @@ const observer = new MutationObserver((records) => {
   }
 
   publishWorkspaceSelection();
+  publishHarnessTheme();
 });
 
-observer.observe(document, { childList: true, subtree: true });
+observer.observe(document, {
+  attributes: true,
+  attributeFilter: ['data-ds-dark-theme', 'style'],
+  childList: true,
+  subtree: true,
+});

@@ -28,15 +28,10 @@ const DSH_STOP_TIMEOUT_MS = 4_000;
 const DSH_PACKAGE_NAME = packageMetadata.dshRuntime?.packageName;
 const DSH_PACKAGE_SCOPE = String(DSH_PACKAGE_NAME || '').split('/')[0];
 const DSH_REQUIRED_VERSION = packageMetadata.dshRuntime?.version;
-const DSH_NPM_SPEC = `${DSH_PACKAGE_NAME}@${DSH_REQUIRED_VERSION}`;
 const MIN_NODE_MAJOR = packageMetadata.dshRuntime?.minimumNodeMajor;
 const PREFERRED_NODE_VERSION = packageMetadata.dshRuntime?.preferredNodeVersion;
 const PREFERRED_NODE_SHA256 = packageMetadata.dshRuntime?.preferredNodeSha256;
-const DSH_ALLOWED_INSTALL_SCRIPTS = [
-  `@deepseek-ai/dsh-subprocess-local@${DSH_REQUIRED_VERSION}`,
-  'node-pty@1.1.0',
-  'koffi@3.1.5',
-];
+const DSH_ALLOWED_INSTALL_SCRIPTS = ['node-pty@1.1.0', 'koffi@3.1.5'];
 const DSH_INSTALL_ATTEMPTS_PER_REGISTRY = 2;
 const DSH_INSTALL_TIMEOUT_MS = 10 * 60_000;
 const NPM_REGISTRY_OFFICIAL = 'https://registry.npmjs.org/';
@@ -92,6 +87,9 @@ let harnessWorkspaceSyncGeneration = 0;
 let navigationPopupMenu = null;
 let modalOverlayOpen = false;
 let pluginOperationPromise = null;
+let dshVersionOperationPromise = null;
+let dshVersionConfigCache = undefined;
+let harnessTheme = 'light';
 const managedInstallationProcesses = new Set();
 const managedInstallationDownloads = new Set();
 const intentionalHostStops = new Set();
@@ -234,6 +232,7 @@ function createMainWindow() {
   mainWindow.once('ready-to-show', () => mainWindow?.show());
   mainWindow.webContents.on('did-finish-load', () => {
     mainWindow?.webContents.send('dsh:state', currentServiceState);
+    publishHarnessTheme();
     publishSidebarState();
   });
   registerSidebarShortcut(mainWindow.webContents);
@@ -338,6 +337,21 @@ function registerIpcHandlers() {
     return bootstrapHarness();
   });
 
+  ipcMain.handle('dsh:version-state', async (event) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return getDshVersionState();
+  });
+
+  ipcMain.handle('dsh:update', async (event, version) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return runDshVersionOperation('update', version);
+  });
+
+  ipcMain.handle('dsh:rollback', async (event, version) => {
+    if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
+    return runDshVersionOperation('rollback', version);
+  });
+
   ipcMain.handle('plugins:list', async (event) => {
     if (event.sender !== mainWindow?.webContents) return { ok: false, error: '无效的请求来源' };
     return getPluginManagerState();
@@ -411,6 +425,14 @@ function registerIpcHandlers() {
   ipcMain.on('harness:workspace-selection', (event, selection) => {
     if (event.sender !== harnessView?.webContents) return;
     void syncWorkspaceFromHarness(selection);
+  });
+
+  ipcMain.on('harness:theme', (event, theme) => {
+    if (event.sender !== harnessView?.webContents) return;
+    if (theme !== 'dark' && theme !== 'light') return;
+    if (harnessTheme === theme) return;
+    harnessTheme = theme;
+    publishHarnessTheme();
   });
 
   ipcMain.handle('workspace:list-files', async (event) => {
@@ -583,6 +605,7 @@ function createNavigationMenuTemplate(menuName) {
   if (menuName === 'help') {
     return [
       action('检查运行环境', 'check-environment'),
+      action('管理 Harness 版本', 'manage-dsh-version'),
       { type: 'separator' },
       action('复制诊断信息', 'copy-diagnostics'),
     ];
@@ -707,6 +730,57 @@ function isExistingDirectory(candidate) {
   } catch {
     return false;
   }
+}
+
+const DSH_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
+function getActiveDshVersion() {
+  if (dshVersionConfigCache === undefined) {
+    dshVersionConfigCache = readDshVersionConfig();
+  }
+  return isValidDshVersion(dshVersionConfigCache?.version)
+    ? dshVersionConfigCache.version
+    : DSH_REQUIRED_VERSION;
+}
+
+function getDshNpmSpec(version = getActiveDshVersion()) {
+  return `${DSH_PACKAGE_NAME}@${version}`;
+}
+
+function getDshVersionConfigPath() {
+  return path.join(app.getPath('userData'), 'dsh-runtime-version.json');
+}
+
+function readDshVersionConfig() {
+  try {
+    const value = JSON.parse(fs.readFileSync(getDshVersionConfigPath(), 'utf8'));
+    return value && typeof value === 'object' ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeDshVersionConfig(version) {
+  if (!isValidDshVersion(version)) throw new Error(`无效的 dsh 版本：${version}`);
+  const configPath = getDshVersionConfigPath();
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  const temporaryPath = `${configPath}.${randomUUID()}.tmp`;
+  fs.writeFileSync(
+    temporaryPath,
+    `${JSON.stringify({ version, updatedAt: new Date().toISOString() }, null, 2)}\n`,
+    'utf8',
+  );
+  if (fs.existsSync(configPath)) fs.rmSync(configPath, { force: true });
+  fs.renameSync(temporaryPath, configPath);
+  dshVersionConfigCache = { version };
+}
+
+function isValidDshVersion(version) {
+  return DSH_VERSION_PATTERN.test(String(version || ''));
+}
+
+function getDshBackupDirectory() {
+  return path.join(app.getPath('userData'), 'dsh-backups');
 }
 
 async function getPluginManagerState() {
@@ -1331,7 +1405,8 @@ async function createDiagnosticReport() {
     `Electron：${process.versions.electron}`,
     `Windows：${process.getSystemVersion()} (${process.arch})`,
     `Node.js：${nodeSummary}`,
-    `要求的 dsh：${DSH_REQUIRED_VERSION}`,
+    `dsh 基线版本：${DSH_REQUIRED_VERSION}`,
+    `dsh 当前版本：${getActiveDshVersion()}`,
     `服务状态：${currentServiceState.state} - ${currentServiceState.message}`,
     `Host：${dshUrl || '未连接'}`,
     `Host PID：${dshProcess?.pid || '无'}`,
@@ -1346,6 +1421,7 @@ async function createDiagnosticReport() {
 }
 
 async function inspectRuntimeEnvironment() {
+  const activeDshVersion = getActiveDshVersion();
   const items = [];
   let runtime = null;
   try {
@@ -1359,7 +1435,7 @@ async function inspectRuntimeEnvironment() {
       items.push({ name: 'Node.js', ok: false, detail: `未检测到兼容版本（最低 v${MIN_NODE_MAJOR}）` });
       items.push({ name: 'npm', ok: false, detail: '未检测' });
     }
-    items.push({ name: 'dsh', ok: false, detail: `未检测（需要 ${DSH_REQUIRED_VERSION}）` });
+    items.push({ name: 'dsh', ok: false, detail: `未检测（需要 ${activeDshVersion}）` });
     items.push({ name: 'pnpm', ok: false, optional: true, detail: '未检测（可选，不影响 Harness 运行）' });
     return { ok: false, items };
   }
@@ -1383,7 +1459,7 @@ async function inspectRuntimeEnvironment() {
   items.push({
     name: 'dsh',
     ok: Boolean(dsh),
-    detail: dsh ? `${dsh.version}（${dsh.cli}）` : `未检测到要求版本 ${DSH_REQUIRED_VERSION}`,
+    detail: dsh ? `${dsh.version}（${dsh.cli}）` : `未检测到要求版本 ${activeDshVersion}`,
   });
   const pnpm = await validatePnpmInstallation(runtime);
   items.push({
@@ -1403,6 +1479,18 @@ function publishServiceState(state, message, details = {}) {
   currentServiceState = { state, message, ...details };
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send('dsh:state', currentServiceState);
+}
+
+function publishHarnessTheme() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('harness:theme', harnessTheme);
+  if (typeof mainWindow.setTitleBarOverlay === 'function') {
+    mainWindow.setTitleBarOverlay({
+      color: '#00000000',
+      symbolColor: harnessTheme === 'dark' ? '#d7dae0' : '#4b5563',
+      height: TOP_NAVIGATION_HEIGHT,
+    });
+  }
 }
 
 function showMainWindow() {
@@ -1696,7 +1784,7 @@ function startDshHost(runtime, statusMessage = '正在启动本地 Harness Host�
     let outputBuffer = '';
     const child = spawn(
       runtime.node,
-      [runtime.cli, '--profile', 'web', '--host', '127.0.0.1', '--port', '0'],
+      [runtime.cli, '--profile', 'web', '--host', '127.0.0.1', '--port', '0', '--no-open'],
       {
         cwd: app.getPath('home'),
         env: {
@@ -1899,12 +1987,13 @@ async function findListeningUrls(pid) {
 }
 
 async function ensureGlobalDsh(options = {}) {
+  const activeDshVersion = getActiveDshVersion();
   publishServiceState('installing', '正在检查电脑上的 DeepSeek Harness…');
   if (!/^@[0-9A-Za-z._-]+\/[0-9A-Za-z._-]+$/.test(DSH_PACKAGE_NAME || '')) {
     throw new Error('package.json 中的 dshRuntime.packageName 无效');
   }
-  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(DSH_REQUIRED_VERSION || '')) {
-    throw new Error(`package.json 中的 ${DSH_PACKAGE_NAME} 版本无效`);
+  if (!isValidDshVersion(activeDshVersion)) {
+    throw new Error(`dsh 版本无效：${activeDshVersion}`);
   }
   if (!Number.isInteger(MIN_NODE_MAJOR) || MIN_NODE_MAJOR < 20) {
     throw new Error('package.json 中的 dshRuntime.minimumNodeMajor 无效');
@@ -1948,7 +2037,7 @@ async function ensureGlobalDsh(options = {}) {
           name: 'DeepSeek Harness',
           status: 'pending',
           currentVersion: null,
-          requiredVersion: DSH_REQUIRED_VERSION,
+          requiredVersion: activeDshVersion,
           description: '安装 Node.js 后继续校验，并在缺失时自动安装。',
           dependsOn: ['node'],
         },
@@ -2018,13 +2107,13 @@ async function ensureGlobalDsh(options = {}) {
         name: 'DeepSeek Harness',
         status: 'missing',
         currentVersion: null,
-        requiredVersion: DSH_REQUIRED_VERSION,
+        requiredVersion: activeDshVersion,
         description: '未检测到要求版本的 dsh，需要通过 npm 下载并安装。',
       },
     ]);
   }
 
-  await withInstallationSession(() => installDshWithRegistryFallback(npmRuntime));
+  await withInstallationSession(() => installDshWithRegistryFallback(npmRuntime, activeDshVersion));
 
   npmRoot = await getGlobalNpmRoot(npmRuntime);
   const packageRoot = path.join(npmRoot, '@deepseek-ai', 'dsh');
@@ -2067,7 +2156,8 @@ async function validatePnpmInstallation(runtime) {
   }
 }
 
-async function installDshWithRegistryFallback(runtime) {
+async function installDshWithRegistryFallback(runtime, version = getActiveDshVersion()) {
+  const dshNpmSpec = getDshNpmSpec(version);
   const registries = await getNpmRegistryCandidates(runtime);
   const failures = [];
 
@@ -2081,12 +2171,12 @@ async function installDshWithRegistryFallback(runtime) {
         : '';
       publishServiceState(
         'installing',
-        `正在安装 ${DSH_NPM_SPEC}（${registryLabel}${attemptText}）…`,
+        `正在安装 ${dshNpmSpec}（${registryLabel}${attemptText}）…`,
       );
 
       const installArguments = [
         runtime.cli,
-        'install', '-g', DSH_NPM_SPEC,
+        'install', '-g', dshNpmSpec,
         `--registry=${registry}`,
         '--no-audit', '--no-fund', '--loglevel=error',
         '--fetch-retries=1',
@@ -2096,7 +2186,12 @@ async function installDshWithRegistryFallback(runtime) {
       ];
       if (runtime.managed) installArguments.push(`--prefix=${runtime.root}`);
       if (runtime.npmMajor >= 11) {
-        installArguments.push(`--allow-scripts=${DSH_ALLOWED_INSTALL_SCRIPTS.join(',')}`);
+        installArguments.push(
+          `--allow-scripts=${[
+            `@deepseek-ai/dsh-subprocess-local@${version}`,
+            ...DSH_ALLOWED_INSTALL_SCRIPTS,
+          ].join(',')}`,
+        );
       }
       const result = await runProcess(
         runtime.node,
@@ -2108,14 +2203,14 @@ async function installDshWithRegistryFallback(runtime) {
       );
       if (result.cancelled) throw new Error('dsh 安装已取消');
       if (result.code === 0) {
-        console.log(`[install] ${DSH_NPM_SPEC} 安装成功，来源：${registryLabel}`);
+        console.log(`[install] ${dshNpmSpec} 安装成功，来源：${registryLabel}`);
         return registry;
       }
 
       const detail = tail(result.stderr || result.stdout, 400);
       failures.push(`${registryLabel}（第 ${attempt} 次）：${detail}`);
       console.error(
-        `[install] ${DSH_NPM_SPEC} 安装失败，来源：${registryLabel}，`
+        `[install] ${dshNpmSpec} 安装失败，来源：${registryLabel}，`
         + `attempt=${attempt}，code=${result.code}：${detail}`,
       );
 
@@ -2130,7 +2225,7 @@ async function installDshWithRegistryFallback(runtime) {
     }
   }
 
-  throw new Error(`dsh 自动安装失败，所有安装源均不可用：${tail(failures.join('\n'), 1_200)}`);
+  throw new Error(`${dshNpmSpec} 自动安装失败，所有安装源均不可用：${tail(failures.join('\n'), 1_200)}`);
 }
 
 function createRuntimeProcessEnvironment(runtime) {
@@ -2195,16 +2290,16 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function validateDshInstallation(node, packageRoot) {
+async function validateDshInstallation(node, packageRoot, expectedVersion = getActiveDshVersion()) {
   const packageFile = path.join(packageRoot, 'package.json');
   if (!fs.existsSync(packageFile)) return null;
 
   try {
     const metadata = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
-    if (metadata.name !== DSH_PACKAGE_NAME || metadata.version !== DSH_REQUIRED_VERSION) {
+    if (metadata.name !== DSH_PACKAGE_NAME || metadata.version !== expectedVersion) {
       console.log(
         `[install] 忽略不匹配的 dsh：${packageRoot} `
-        + `(检测到 ${metadata.version || '未知'}，需要 ${DSH_REQUIRED_VERSION})`,
+        + `(检测到 ${metadata.version || '未知'}，需要 ${expectedVersion})`,
       );
       return null;
     }
@@ -2217,17 +2312,281 @@ async function validateDshInstallation(node, packageRoot) {
 
     const versionCheck = await runProcess(node, [cli, '--version'], 30_000, false);
     const reportedVersion = versionCheck.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
-    if (versionCheck.code !== 0 || reportedVersion !== DSH_REQUIRED_VERSION) {
+    if (versionCheck.code !== 0 || reportedVersion !== expectedVersion) {
       console.log(
         `[install] dsh CLI 健康检查失败：${packageRoot} `
         + `(code=${versionCheck.code}, version=${reportedVersion || '未知'})`,
       );
       return null;
     }
-    return { node, cli, version: reportedVersion };
+    return { node, cli, version: reportedVersion, packageRoot };
   } catch (error) {
     console.error(`[install] 无法校验 dsh：${packageRoot}`, error);
     return null;
+  }
+}
+
+async function getDshVersionState() {
+  const activeVersion = getActiveDshVersion();
+  const backups = listDshBackups();
+  let runtime = null;
+  try {
+    const runtimes = await findNpmRuntimes();
+    runtime = runtimes.find((candidate) => candidate.major >= MIN_NODE_MAJOR) || null;
+  } catch (error) {
+    return {
+      ok: false,
+      error: `无法检测 Node.js：${error.message || error}`,
+      packageName: DSH_PACKAGE_NAME,
+      baselineVersion: DSH_REQUIRED_VERSION,
+      activeVersion,
+      currentVersion: null,
+      availableVersions: uniqueSortedDshVersions([DSH_REQUIRED_VERSION, activeVersion, ...backups.map((item) => item.version)]),
+      backups: backups.map(toPublicDshBackup),
+    };
+  }
+
+  if (!runtime) {
+    return {
+      ok: false,
+      error: `未检测到兼容的 Node.js（最低 v${MIN_NODE_MAJOR}）`,
+      packageName: DSH_PACKAGE_NAME,
+      baselineVersion: DSH_REQUIRED_VERSION,
+      activeVersion,
+      currentVersion: null,
+      availableVersions: uniqueSortedDshVersions([DSH_REQUIRED_VERSION, activeVersion, ...backups.map((item) => item.version)]),
+      backups: backups.map(toPublicDshBackup),
+    };
+  }
+
+  const installed = await findInstalledDsh(runtime, activeVersion);
+  let catalog = [];
+  let catalogError = '';
+  try {
+    catalog = await getAvailableDshVersions(runtime);
+  } catch (error) {
+    catalogError = error.message || String(error);
+  }
+  return {
+    ok: Boolean(installed),
+    error: installed ? undefined : `未找到可用的 dsh ${activeVersion}`,
+    catalogError: catalogError || undefined,
+    packageName: DSH_PACKAGE_NAME,
+    baselineVersion: DSH_REQUIRED_VERSION,
+    activeVersion,
+    currentVersion: installed?.version || null,
+    packageRoot: installed?.packageRoot || null,
+    availableVersions: uniqueSortedDshVersions([
+      ...catalog,
+      DSH_REQUIRED_VERSION,
+      activeVersion,
+      ...backups.map((item) => item.version),
+    ]),
+    backups: backups.map(toPublicDshBackup),
+  };
+}
+
+async function findInstalledDsh(runtime, expectedVersion = getActiveDshVersion()) {
+  for (const packageRoot of await getDshPackageRoots(runtime)) {
+    const installed = await validateDshInstallation(runtime.node, packageRoot, expectedVersion);
+    if (installed) return installed;
+  }
+  return null;
+}
+
+async function getDshPackageRoots(runtime) {
+  const roots = [path.join(
+    app.getPath('home'), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh',
+  )];
+  try {
+    const npmRoot = await getGlobalNpmRoot(runtime);
+    roots.push(path.join(npmRoot, '@deepseek-ai', 'dsh'));
+  } catch (error) {
+    console.error(`[version] 无法读取 dsh npm 根目录：${error.message || error}`);
+  }
+  return [...new Set(roots.map((root) => path.resolve(root)))];
+}
+
+async function getAvailableDshVersions(runtime) {
+  const failures = [];
+  for (const registry of await getNpmRegistryCandidates(runtime)) {
+    const result = await runProcess(
+      runtime.node,
+      [runtime.cli, 'view', DSH_PACKAGE_NAME, 'versions', '--json', `--registry=${registry}`],
+      60_000,
+      false,
+      false,
+      createRuntimeProcessEnvironment(runtime),
+    );
+    if (result.code !== 0) {
+      failures.push(`${formatRegistryLabel(registry)}：${tail(result.stderr || result.stdout, 240)}`);
+      continue;
+    }
+    try {
+      const values = JSON.parse(result.stdout.trim());
+      const versions = Array.isArray(values) ? values.filter(isValidDshVersion) : [values].filter(isValidDshVersion);
+      if (versions.length) return uniqueSortedDshVersions(versions);
+    } catch (error) {
+      failures.push(`${formatRegistryLabel(registry)}：返回内容无法解析`);
+    }
+  }
+  throw new Error(`无法读取 dsh 可用版本：${tail(failures.join('；'), 800)}`);
+}
+
+function listDshBackups() {
+  const directory = getDshBackupDirectory();
+  if (!fs.existsSync(directory)) return [];
+  const backups = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const backupPath = path.join(directory, entry.name);
+    try {
+      const metadata = JSON.parse(fs.readFileSync(path.join(backupPath, 'package.json'), 'utf8'));
+      if (metadata.name !== DSH_PACKAGE_NAME || !isValidDshVersion(metadata.version)) continue;
+      const stat = fs.statSync(backupPath);
+      backups.push({
+        version: metadata.version,
+        path: backupPath,
+        createdAt: stat.birthtimeMs || stat.mtimeMs,
+      });
+    } catch {}
+  }
+  return backups.sort((left, right) => right.createdAt - left.createdAt);
+}
+
+function toPublicDshBackup(backup) {
+  return { version: backup.version, createdAt: new Date(backup.createdAt).toISOString() };
+}
+
+async function backupDshInstallation(packageRoot, version) {
+  if (!packageRoot || !fs.existsSync(packageRoot)) throw new Error('找不到当前 dsh 安装目录，无法创建回退点');
+  const directory = getDshBackupDirectory();
+  fs.mkdirSync(directory, { recursive: true });
+  const backupPath = path.join(
+    directory,
+    `${version}-${Date.now()}-${randomUUID().slice(0, 8)}`,
+  );
+  fs.cpSync(packageRoot, backupPath, { recursive: true, force: true, dereference: true });
+  console.log(`[version] 已备份 dsh ${version}：${backupPath}`);
+  return { version, path: backupPath, createdAt: Date.now() };
+}
+
+function restoreDshBackup(packageRoot, backupPath) {
+  if (!fs.existsSync(backupPath)) throw new Error(`回退点不存在：${backupPath}`);
+  const temporaryPath = `${packageRoot}.restore-${randomUUID()}`;
+  fs.mkdirSync(path.dirname(packageRoot), { recursive: true });
+  fs.cpSync(backupPath, temporaryPath, { recursive: true, force: true, dereference: true });
+  try {
+    if (fs.existsSync(packageRoot)) fs.rmSync(packageRoot, { recursive: true, force: true });
+    fs.renameSync(temporaryPath, packageRoot);
+  } catch (error) {
+    if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function compareDshVersions(left, right) {
+  const parse = (value) => {
+    const match = String(value).match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+    return match ? [Number(match[1]), Number(match[2]), Number(match[3]), match[4] || ''] : [0, 0, 0, ''];
+  };
+  const a = parse(left);
+  const b = parse(right);
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  if (!a[3] && b[3]) return 1;
+  if (a[3] && !b[3]) return -1;
+  return a[3].localeCompare(b[3]);
+}
+
+function uniqueSortedDshVersions(versions) {
+  return [...new Set(versions.filter(isValidDshVersion))].sort((left, right) => compareDshVersions(right, left));
+}
+
+function runDshVersionOperation(action, version) {
+  if (dshVersionOperationPromise) return dshVersionOperationPromise;
+  dshVersionOperationPromise = performDshVersionOperation(action, version).finally(() => {
+    dshVersionOperationPromise = null;
+  });
+  return dshVersionOperationPromise;
+}
+
+async function performDshVersionOperation(action, version) {
+  if (usingExternalHost) return { ok: false, error: '当前连接的是外部 Harness Host，无法管理其 dsh 版本' };
+  if (action !== 'update' && action !== 'rollback') return { ok: false, error: '未知的版本操作' };
+  const targetVersion = String(version || '').trim();
+  if (!isValidDshVersion(targetVersion)) return { ok: false, error: '请选择有效的 dsh 版本' };
+
+  const runtimes = await findNpmRuntimes();
+  const runtime = runtimes.find((candidate) => candidate.major >= MIN_NODE_MAJOR);
+  if (!runtime) return { ok: false, error: `未检测到兼容的 Node.js（最低 v${MIN_NODE_MAJOR}）` };
+  const activeVersion = getActiveDshVersion();
+  const installedCurrent = await findInstalledDsh(runtime, activeVersion);
+  const packageRoots = await getDshPackageRoots(runtime);
+  const current = installedCurrent || (action === 'rollback' ? {
+    node: runtime.node,
+    cli: null,
+    version: activeVersion,
+    packageRoot: packageRoots.find((root) => fs.existsSync(root)),
+  } : null);
+  if (!current?.packageRoot) return { ok: false, error: `未找到当前 dsh ${activeVersion} 的有效安装` };
+
+  let selectedBackup = null;
+  if (action === 'rollback') {
+    selectedBackup = listDshBackups().find((backup) => backup.version === targetVersion);
+    if (!selectedBackup) return { ok: false, error: `没有可用于回退的 ${targetVersion} 备份` };
+  } else {
+    if (compareDshVersions(targetVersion, current.version) <= 0) {
+      return { ok: false, error: `更新版本必须高于当前版本 ${current.version}` };
+    }
+    let available;
+    try {
+      available = await getAvailableDshVersions(runtime);
+    } catch (error) {
+      return { ok: false, error: error.message || String(error) };
+    }
+    if (!available.includes(targetVersion)) return { ok: false, error: `npm 中未找到 ${targetVersion}` };
+  }
+
+  publishServiceState('installing', action === 'update'
+    ? `正在备份并更新 dsh：${current.version} → ${targetVersion}…`
+    : `正在回退 dsh：${current.version} → ${targetVersion}…`);
+  cancelHostRecovery();
+  destroyHarnessView();
+  await stopDshHost();
+
+  let currentBackup = null;
+  try {
+    currentBackup = await backupDshInstallation(current.packageRoot, current.version);
+    if (action === 'update') {
+      await withInstallationSession(() => installDshWithRegistryFallback(runtime, targetVersion));
+    } else {
+      restoreDshBackup(current.packageRoot, selectedBackup.path);
+    }
+
+    const installed = await findInstalledDsh(runtime, targetVersion);
+    if (!installed) throw new Error(`dsh ${targetVersion} 安装后健康检查未通过`);
+    writeDshVersionConfig(targetVersion);
+    const boot = await bootstrapHarness();
+    const state = await getDshVersionState();
+    return {
+      ok: Boolean(boot.ok),
+      changed: true,
+      version: targetVersion,
+      state,
+      error: boot.ok ? undefined : boot.error || '版本已切换，但 Harness 启动失败',
+    };
+  } catch (error) {
+    writeDshVersionConfig(activeVersion);
+    try {
+      restoreDshBackup(current.packageRoot, currentBackup?.path);
+    } catch (restoreError) {
+      console.error('[version] 版本操作失败且无法恢复原版本：', restoreError);
+    }
+    publishServiceState('error', `dsh 版本操作失败：${error.message || error}`);
+    showMainWindow();
+    return { ok: false, error: error.message || String(error), rolledBack: true };
   }
 }
 

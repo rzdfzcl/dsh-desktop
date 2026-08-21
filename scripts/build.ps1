@@ -56,6 +56,24 @@ function Assert-GuiExecutable {
   }
 }
 
+function Get-Sha256Hex {
+  param([Parameter(Mandatory)][string]$Path)
+
+  $getFileHash = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+  if ($getFileHash) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+  }
+
+  $sha256 = [Security.Cryptography.SHA256]::Create()
+  $stream = [IO.File]::OpenRead($Path)
+  try {
+    return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+  } finally {
+    $stream.Dispose()
+    $sha256.Dispose()
+  }
+}
+
 function Get-DependencyFingerprint {
   if (-not (Test-Path -LiteralPath $packageLockFile -PathType Leaf)) {
     throw "package-lock.json not found: $packageLockFile"
@@ -427,7 +445,7 @@ try {
     [PSCustomObject]@{
       File = $item.FullName
       SizeMB = [Math]::Round($item.Length / 1MB, 2)
-      SHA256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
+      SHA256 = Get-Sha256Hex -Path $item.FullName
       Signed = $script:signingEnabled
     }
   }

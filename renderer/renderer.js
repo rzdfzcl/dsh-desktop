@@ -52,6 +52,16 @@ const environmentDialogSummary = document.querySelector('#environment-dialog-sum
 const environmentDialogList = document.querySelector('#environment-dialog-list');
 const environmentDialogClose = document.querySelector('#environment-dialog-close');
 const environmentDialogDone = document.querySelector('#environment-dialog-done');
+const dshVersionDialog = document.querySelector('#dsh-version-dialog');
+const dshVersionDialogPanel = document.querySelector('#dsh-version-dialog-panel');
+const dshVersionDialogSummary = document.querySelector('#dsh-version-dialog-summary');
+const dshVersionDialogClose = document.querySelector('#dsh-version-dialog-close');
+const dshVersionDialogDone = document.querySelector('#dsh-version-dialog-done');
+const dshCurrentVersion = document.querySelector('#dsh-current-version');
+const dshVersionSelect = document.querySelector('#dsh-version-select');
+const dshUpdateButton = document.querySelector('#dsh-update-button');
+const dshBackupList = document.querySelector('#dsh-backup-list');
+const dshVersionFeedback = document.querySelector('#dsh-version-feedback');
 const topNavigation = document.querySelector('#top-navigation');
 const harnessServiceStatus = document.querySelector('#harness-service-status');
 const harnessStatusLabel = document.querySelector('#harness-status-label');
@@ -86,6 +96,8 @@ const collapsedReviewDirectories = new Set();
 let activeTopMenu = null;
 let lastContentFocus = null;
 let environmentDialogPreviousFocus = null;
+let dshVersionDialogPreviousFocus = null;
+let dshVersionDialogBusy = false;
 let environmentCheckSequence = 0;
 let reviewSourcePreference = 'auto';
 let activeReviewSource = null;
@@ -118,6 +130,7 @@ window.desktop.sidebar.onState(({ open, tool, workspace, panelWidth }) => {
   applySidebarState(open, tool, workspace, panelWidth);
 });
 window.desktop.workspace.onChanged((change) => applyWorkspaceChange(change));
+window.desktop.theme.onChanged((theme) => applyHarnessTheme(theme));
 
 window.desktop.navigation.onMenuAction((action) => void runTopAction(action));
 window.desktop.navigation.onMenuClosed(() => resetTopMenuState());
@@ -212,6 +225,7 @@ async function runTopAction(action) {
     renderEnvironmentDialog(result);
     return result;
   }
+  if (action === 'manage-dsh-version') return openDshVersionDialog();
   if (action === 'copy-diagnostics') return copyDiagnostics();
   if (action === 'reload') return runNavigationAction('reload');
   if (action === 'restart-harness') {
@@ -221,8 +235,7 @@ async function runTopAction(action) {
   }
   if (action === 'toggle-sidebar') return window.desktop.sidebar.setOpen(!sidebarOpen);
   if (action.startsWith('tool-')) {
-    await window.desktop.sidebar.setTool(action.slice(5));
-    return window.desktop.sidebar.setOpen(true);
+    return toggleSidebarTool(action.slice(5));
   }
   if (['copy', 'paste', 'select-all'].includes(action)) {
     if (lastContentFocus?.isConnected && typeof lastContentFocus.focus === 'function') lastContentFocus.focus();
@@ -296,18 +309,184 @@ function closeEnvironmentDialog() {
   environmentDialogPreviousFocus = null;
 }
 
+async function openDshVersionDialog() {
+  if (dshVersionDialog.hidden) dshVersionDialogPreviousFocus = document.activeElement;
+  dshVersionDialog.hidden = false;
+  dshVersionDialog.setAttribute('aria-busy', 'true');
+  dshVersionDialogSummary.textContent = '正在读取 npm 版本和本地回退点…';
+  dshCurrentVersion.textContent = '读取中…';
+  dshVersionFeedback.textContent = '';
+  dshVersionSelect.replaceChildren(new Option('正在读取…', ''));
+  dshVersionSelect.disabled = true;
+  dshUpdateButton.disabled = true;
+  dshBackupList.replaceChildren(Object.assign(document.createElement('div'), {
+    className: 'environment-dialog-loading',
+    textContent: '正在读取备份…',
+  }));
+  document.body.classList.add('has-modal-open');
+  dshVersionDialogPanel.focus();
+  void window.desktop.ui.setModalOpen(true);
+  try {
+    const result = await window.desktop.dsh.getVersionState();
+    renderDshVersionState(result);
+  } catch (error) {
+    renderDshVersionState({ ok: false, error: error.message || String(error), backups: [], availableVersions: [] });
+  }
+}
+
+function renderDshVersionState(state) {
+  const current = state?.currentVersion || state?.activeVersion || '未安装';
+  dshVersionDialog.setAttribute('aria-busy', 'false');
+  dshCurrentVersion.textContent = current;
+  dshVersionDialogSummary.textContent = state?.error
+    ? state.error
+    : state?.catalogError
+      ? `当前 ${current}，无法读取最新版本：${state.catalogError}`
+      : `当前 ${current}，可从下方选择版本更新`;
+
+  const updateVersions = (Array.isArray(state?.availableVersions) ? state.availableVersions : [])
+    .filter((version) => compareDshVersions(version, current) > 0);
+  dshVersionSelect.replaceChildren();
+  if (!updateVersions.length) {
+    dshVersionSelect.append(new Option('暂无可用更新', ''));
+    dshVersionSelect.disabled = true;
+    dshUpdateButton.disabled = true;
+  } else {
+    for (const version of updateVersions) dshVersionSelect.append(new Option(version, version));
+    dshVersionSelect.disabled = false;
+    dshUpdateButton.disabled = dshVersionDialogBusy;
+  }
+
+  const backups = Array.isArray(state?.backups) ? state.backups : [];
+  if (!backups.length) {
+    dshBackupList.replaceChildren(Object.assign(document.createElement('div'), {
+      className: 'environment-dialog-loading',
+      textContent: '暂无回退点。完成一次更新后会自动创建。',
+    }));
+  } else {
+    dshBackupList.replaceChildren(...backups.map((backup) => {
+      const row = document.createElement('div');
+      row.className = 'dsh-backup-row';
+      const label = document.createElement('span');
+      label.textContent = backup.version;
+      const date = document.createElement('small');
+      date.textContent = backup.createdAt ? new Date(backup.createdAt).toLocaleString() : '';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = '回退';
+      button.disabled = dshVersionDialogBusy || backup.version === current;
+      button.addEventListener('click', () => void rollbackDshVersion(backup.version));
+      row.append(label, date, button);
+      return row;
+    }));
+  }
+}
+
+function compareDshVersions(left, right) {
+  const parse = (value) => {
+    const match = String(value).match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+    return match ? [Number(match[1]), Number(match[2]), Number(match[3]), match[4] || ''] : [0, 0, 0, ''];
+  };
+  const a = parse(left);
+  const b = parse(right);
+  for (let index = 0; index < 3; index += 1) if (a[index] !== b[index]) return a[index] - b[index];
+  if (!a[3] && b[3]) return 1;
+  if (a[3] && !b[3]) return -1;
+  return a[3].localeCompare(b[3]);
+}
+
+async function updateDshVersion() {
+  const version = dshVersionSelect.value;
+  if (!version || dshVersionDialogBusy) return;
+  await runDshVersionChange('update', version);
+}
+
+async function rollbackDshVersion(version) {
+  if (dshVersionDialogBusy) return;
+  await runDshVersionChange('rollback', version);
+}
+
+async function runDshVersionChange(action, version) {
+  dshVersionDialogBusy = true;
+  dshUpdateButton.disabled = true;
+  dshVersionSelect.disabled = true;
+  dshVersionFeedback.dataset.state = 'loading';
+  dshVersionFeedback.textContent = action === 'update'
+    ? `正在更新到 ${version}，请稍候…`
+    : `正在回退到 ${version}，请稍候…`;
+  let refreshedState = null;
+  try {
+    const result = action === 'update'
+      ? await window.desktop.dsh.update(version)
+      : await window.desktop.dsh.rollback(version);
+    if (!result?.ok) {
+      dshVersionFeedback.dataset.state = 'error';
+      dshVersionFeedback.textContent = result?.error || '版本切换失败';
+    } else {
+      dshVersionFeedback.dataset.state = 'success';
+      dshVersionFeedback.textContent = `已切换到 ${version}`;
+    }
+    if (result?.state) {
+      refreshedState = result.state;
+      renderDshVersionState(result.state);
+    }
+    else {
+      const state = await window.desktop.dsh.getVersionState();
+      refreshedState = state;
+      renderDshVersionState(state);
+    }
+  } catch (error) {
+    dshVersionFeedback.dataset.state = 'error';
+    dshVersionFeedback.textContent = error.message || String(error);
+  } finally {
+    dshVersionDialogBusy = false;
+    if (refreshedState) renderDshVersionState(refreshedState);
+    if (!dshVersionDialog.hidden) {
+      dshVersionSelect.disabled = !dshVersionSelect.options.length || !dshVersionSelect.value;
+      dshUpdateButton.disabled = dshVersionSelect.disabled;
+    }
+  }
+}
+
+function closeDshVersionDialog() {
+  if (dshVersionDialog.hidden || dshVersionDialogBusy) return;
+  dshVersionDialog.hidden = true;
+  document.body.classList.remove('has-modal-open');
+  void window.desktop.ui.setModalOpen(false);
+  if (dshVersionDialogPreviousFocus?.isConnected) dshVersionDialogPreviousFocus.focus();
+  dshVersionDialogPreviousFocus = null;
+}
+
 environmentDialogClose.addEventListener('click', closeEnvironmentDialog);
 environmentDialogDone.addEventListener('click', closeEnvironmentDialog);
 environmentDialog.addEventListener('pointerdown', (event) => {
   if (event.target === environmentDialog) closeEnvironmentDialog();
 });
 document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !dshVersionDialog.hidden) {
+    event.preventDefault();
+    closeDshVersionDialog();
+    return;
+  }
   if (event.key !== 'Escape' || environmentDialog.hidden) return;
   event.preventDefault();
   closeEnvironmentDialog();
 });
 
+dshVersionDialogClose.addEventListener('click', closeDshVersionDialog);
+dshVersionDialogDone.addEventListener('click', closeDshVersionDialog);
+dshVersionDialog.addEventListener('pointerdown', (event) => {
+  if (event.target === dshVersionDialog) closeDshVersionDialog();
+});
+dshUpdateButton.addEventListener('click', () => void updateDshVersion());
+
 void initializeSidebar();
+
+function applyHarnessTheme(theme) {
+  const normalizedTheme = theme === 'dark' ? 'dark' : 'light';
+  document.body.dataset.harnessTheme = normalizedTheme;
+  document.documentElement.style.colorScheme = normalizedTheme;
+}
 
 async function initializeSidebar() {
   const result = await window.desktop.sidebar.getState();
@@ -332,7 +511,15 @@ sidebarToggle.addEventListener('click', () => {
 });
 
 for (const button of document.querySelectorAll('[data-sidebar-tool]')) {
-  button.addEventListener('click', () => void window.desktop.sidebar.setTool(button.dataset.sidebarTool));
+  button.addEventListener('click', () => void toggleSidebarTool(button.dataset.sidebarTool));
+}
+
+async function toggleSidebarTool(tool) {
+  if (!Object.hasOwn(toolTitles, tool)) return;
+  if (sidebarOpen && activeTool === tool) {
+    return window.desktop.sidebar.setOpen(false);
+  }
+  return window.desktop.sidebar.setTool(tool);
 }
 
 function applySidebarState(open, tool = activeTool, workspace = currentWorkspace, panelWidth = sidebarPanelWidth) {

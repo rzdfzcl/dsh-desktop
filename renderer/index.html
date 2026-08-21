@@ -7,7 +7,7 @@
     <title>DeepSeek Harness</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
-  <body data-sidebar-open="false">
+  <body data-sidebar-open="false" data-harness-theme="light">
     <header id="top-navigation" class="top-navigation" aria-label="应用导航栏">
       <div id="harness-service-status" class="harness-service-status" data-state="starting" role="status" aria-live="polite" title="正在启动 DeepSeek Harness">
         <span class="harness-status-dot" aria-hidden="true"></span>
@@ -47,6 +47,7 @@
           <button class="top-menu-button" type="button" data-top-menu="help" aria-haspopup="menu" aria-expanded="false">帮助</button>
           <div class="top-menu-popover" data-top-menu-popover="help" role="menu" hidden>
             <button type="button" role="menuitem" data-top-action="check-environment"><span>检查运行环境</span></button>
+            <button type="button" role="menuitem" data-top-action="manage-dsh-version"><span>管理 Harness 版本</span></button>
             <div class="top-menu-separator" role="separator"></div>
             <button type="button" role="menuitem" data-top-action="copy-diagnostics"><span>复制诊断信息</span></button>
           </div>
@@ -209,6 +210,33 @@
         <footer class="environment-dialog-footer">
           <span>DeepSeek Harness Desktop</span>
           <button id="environment-dialog-done" class="modal-done-button" type="button">完成</button>
+        </footer>
+      </section>
+    </div>
+
+    <div id="dsh-version-dialog" class="modal-backdrop" hidden>
+      <section id="dsh-version-dialog-panel" class="environment-dialog dsh-version-dialog" role="dialog" aria-modal="true" aria-labelledby="dsh-version-dialog-title" tabindex="-1">
+        <header class="environment-dialog-header">
+          <div class="environment-dialog-heading">
+            <span id="dsh-version-dialog-icon" class="environment-dialog-icon" aria-hidden="true">↻</span>
+            <div>
+              <h2 id="dsh-version-dialog-title">管理 Harness 版本</h2>
+              <p id="dsh-version-dialog-summary">正在读取可用版本…</p>
+            </div>
+          </div>
+          <button id="dsh-version-dialog-close" class="modal-close-button" type="button" aria-label="关闭版本管理" title="关闭">×</button>
+        </header>
+        <div class="dsh-version-content">
+          <div class="dsh-version-current"><span>当前版本</span><strong id="dsh-current-version">—</strong></div>
+          <label class="dsh-version-target" for="dsh-version-select"><span>更新到</span><select id="dsh-version-select" disabled><option>暂无可用更新</option></select></label>
+          <button id="dsh-update-button" class="primary" type="button" disabled>更新 Harness</button>
+          <div class="dsh-version-backup-heading"><strong>可回退版本</strong><span>更新前会自动创建备份</span></div>
+          <div id="dsh-backup-list" class="dsh-backup-list"><div class="environment-dialog-loading">正在读取备份…</div></div>
+          <div id="dsh-version-feedback" class="dsh-version-feedback" role="status" aria-live="polite"></div>
+        </div>
+        <footer class="environment-dialog-footer">
+          <span>版本切换会重启 Harness 服务</span>
+          <button id="dsh-version-dialog-done" class="modal-done-button" type="button">完成</button>
         </footer>
       </section>
     </div>

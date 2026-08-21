@@ -17,6 +17,9 @@ contextBridge.exposeInMainWorld('desktop', {
     copyDiagnostics: () => ipcRenderer.invoke('dsh:copy-diagnostics'),
     checkEnvironment: () => ipcRenderer.invoke('dsh:check-environment'),
     restart: () => ipcRenderer.invoke('dsh:restart'),
+    getVersionState: () => ipcRenderer.invoke('dsh:version-state'),
+    update: (version) => ipcRenderer.invoke('dsh:update', version),
+    rollback: (version) => ipcRenderer.invoke('dsh:rollback', version),
   },
   sidebar: {
     getState: () => ipcRenderer.invoke('sidebar:get-state'),
@@ -61,5 +64,8 @@ contextBridge.exposeInMainWorld('desktop', {
   },
   ui: {
     setModalOpen: (open) => ipcRenderer.invoke('ui:set-modal-open', Boolean(open)),
+  },
+  theme: {
+    onChanged: (callback) => subscribe('harness:theme', callback),
   },
 });
